@@ -12,6 +12,7 @@ mod loupe;
 mod menu;
 mod theme;
 mod thumbs;
+mod tree;
 
 use std::time::Duration;
 
@@ -28,9 +29,12 @@ pub struct PolyRoomApp {
     grid: grid::GridState,
     filmstrip: grid::GridState,
     loupe: loupe::LoupeView,
+    tree: tree::TreeState,
     /// Text in the filter box (the engine holds the applied filter).
     filter: String,
     show_shortcuts: bool,
+    /// A command ran since the last frame was drawn, so what's on screen is stale.
+    dirty: bool,
 }
 
 impl PolyRoomApp {
@@ -61,7 +65,9 @@ impl PolyRoomApp {
             grid: grid::GridState::default(),
             filmstrip: grid::GridState::default(),
             loupe: loupe::LoupeView::default(),
+            tree: tree::TreeState::default(),
             show_shortcuts: false,
+            dirty: false,
         };
         if let Some(dir) = import {
             app.dispatch("library.import", &json!({ "path": dir }));
@@ -70,6 +76,7 @@ impl PolyRoomApp {
     }
 
     fn dispatch(&mut self, id: &str, args: &Value) {
+        self.dirty = true;
         if let Err(e) = self.registry.run(id, &mut self.session, args) {
             log::warn!("{e}");
             self.session.set_status(e.to_string());
@@ -104,6 +111,7 @@ impl PolyRoomApp {
                     }
                 }
                 Request::ShowShortcuts => self.show_shortcuts = true,
+                Request::ShowInExplorer(path) => show_in_file_manager(&path, &mut self.session),
                 Request::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
@@ -149,9 +157,14 @@ impl PolyRoomApp {
                     layout::empty_library(ui, actions);
                 } else if show_loupe {
                     self.loupe.show(ui, frame, &self.session);
-                } else if self.session.visible().is_empty() {
-                    layout::no_matches(ui);
                 } else {
+                    layout::breadcrumbs(ui, &self.session, actions);
+                    if self.session.visible().is_empty()
+                        && self.session.visible_folders().is_empty()
+                    {
+                        layout::no_matches(ui);
+                        return;
+                    }
                     grid::grid(
                         ui,
                         &mut self.session,
@@ -164,11 +177,28 @@ impl PolyRoomApp {
     }
 }
 
+/// Opens `path` in the platform's file manager.
+fn show_in_file_manager(path: &std::path::Path, session: &mut Session) {
+    let program = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    if let Err(e) = std::process::Command::new(program).arg(path).spawn() {
+        session.set_status(format!("Could not open {}: {e}", path.display()));
+    }
+}
+
 impl eframe::App for PolyRoomApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.session.poll();
         self.thumbs.begin_frame();
+        for id in self.session.take_stale_thumbnails() {
+            self.thumbs.remove(id);
+        }
         for (id, image) in self.session.take_thumbnails() {
             self.thumbs.insert(&ctx, id, &image);
         }
@@ -217,7 +247,7 @@ impl eframe::App for PolyRoomApp {
                 actions.push("view.toggle_filmstrip");
             }
             layout::toolbar(ui, &self.session, &mut self.filter, &mut actions);
-            layout::left_panel(ui, &mut self.session, &mut actions);
+            layout::left_panel(ui, &self.session, &mut self.tree, &mut actions);
         }
         layout::right_panel(ui, &mut self.session, &mut actions);
         self.center(ui, frame, &mut actions);
@@ -227,6 +257,14 @@ impl eframe::App for PolyRoomApp {
             self.dispatch(id, &args);
         }
         self.handle_requests(&ctx);
+
+        // Commands change state after this frame was drawn (clicks are only known while
+        // drawing). Start their follow-up work now, e.g. loading the newly selected model,
+        // and draw again so the screen shows the result instead of waiting for the next input.
+        if std::mem::take(&mut self.dirty) {
+            self.session.poll();
+            ctx.request_repaint();
+        }
 
         if self.session.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(50));

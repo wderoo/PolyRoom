@@ -36,6 +36,11 @@ impl ThumbTextures {
         self.evict();
     }
 
+    /// Drops the texture for `id` so it is reloaded (its file changed).
+    pub fn remove(&mut self, id: ModelId) {
+        self.textures.remove(&id);
+    }
+
     /// The texture for `id`, marking it as recently used.
     pub fn get(&mut self, id: ModelId) -> Option<egui::TextureId> {
         let frame = self.frame;

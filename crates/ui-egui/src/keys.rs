@@ -7,6 +7,8 @@ fn map_key(key: EKey) -> Option<Key> {
     let k = match key {
         EKey::Enter => Key::Enter,
         EKey::Escape => Key::Escape,
+        EKey::Backspace => Key::Backspace,
+        EKey::F5 => Key::F5,
         EKey::Tab => Key::Tab,
         EKey::ArrowLeft => Key::Left,
         EKey::ArrowRight => Key::Right,
@@ -84,6 +86,10 @@ mod tests {
         assert_eq!(
             shortcut(EKey::Equals, Modifiers::SHIFT),
             Some(Shortcut::key(Key::Plus))
+        );
+        assert_eq!(
+            shortcut(EKey::F5, Modifiers::NONE),
+            Some(Shortcut::key(Key::F5))
         );
         assert_eq!(shortcut(EKey::F12, Modifiers::NONE), None);
     }

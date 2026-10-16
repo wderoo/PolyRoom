@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
-use polyroom_catalog::{Catalog, CatalogError, Model, ModelId, Op, ScannedFile};
+use polyroom_catalog::{Catalog, CatalogError, Model, ModelId, Op, ScannedFile, SyncReport};
 use polyroom_mesh::Mesh;
 use polyroom_preview::{Event, PreviewService};
 use polyroom_render::Image;
+
+use crate::folders::{self, FolderNode};
 
 /// The top-level module, like Lightroom's Library/Develop switcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,17 +51,32 @@ pub enum Request {
     PickImportFolder,
     /// Show the keyboard shortcut overview.
     ShowShortcuts,
+    /// Open a folder in the system file manager.
+    ShowInExplorer(PathBuf),
     /// Close the application.
     Quit,
 }
 
 /// Which models the grid shows, like Lightroom's Catalog/Folders panel.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum Collection {
     #[default]
     All,
     PreviousImport,
     Folder(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+enum ScanKind {
+    Import,
+    Refresh { root: PathBuf },
+}
+
+/// A folder scan running on a background thread.
+struct Scan {
+    folder: PathBuf,
+    kind: ScanKind,
+    result: Receiver<Vec<ScannedFile>>,
 }
 
 /// Where the catalog and caches live on disk.
@@ -114,7 +131,10 @@ pub struct Session {
     pub(crate) collection: Collection,
     pub(crate) filter: String,
     visible: Vec<ModelId>,
+    /// Subfolders shown as cells before the models when browsing a folder.
+    visible_folders: Vec<PathBuf>,
     visible_for: Option<(u64, Collection, String)>,
+    folder_tree: Vec<FolderNode>,
     pub(crate) current: Option<ModelId>,
     pub(crate) selection: HashSet<ModelId>,
     pub(crate) anchor: Option<ModelId>,
@@ -122,7 +142,8 @@ pub struct Session {
     fresh_thumbnails: Vec<(ModelId, Image)>,
     /// Thumbnails that failed this session; not retried until restart.
     thumbnail_failed: HashSet<ModelId>,
-    scans: Vec<Receiver<(PathBuf, Vec<ScannedFile>)>>,
+    scans: Vec<Scan>,
+    stale_thumbnails: Vec<ModelId>,
     status: String,
     requests: Vec<Request>,
 }
@@ -146,6 +167,10 @@ impl Session {
         s.catalog = Catalog::open(&paths.catalog_dir)?;
         s.preview = Some(PreviewService::start(paths.cache_dir.clone()));
         s.status = format!("{} models in library", s.catalog.models().len());
+        // Start in the first imported folder, browsing it like a file manager.
+        if let Some(root) = s.catalog.folders().first() {
+            s.collection = Collection::Folder(root.clone());
+        }
         s.refresh_visible();
         s.current = s.visible.first().copied();
         s.selection = s.current.into_iter().collect();
@@ -177,6 +202,29 @@ impl Session {
     /// Models shown in the grid, in display order.
     pub fn visible(&self) -> &[ModelId] {
         &self.visible
+    }
+
+    /// Subfolders of the current folder, shown in the grid before its models.
+    pub fn visible_folders(&self) -> &[PathBuf] {
+        &self.visible_folders
+    }
+
+    /// One folder tree per imported folder.
+    pub fn folder_tree(&self) -> &[FolderNode] {
+        &self.folder_tree
+    }
+
+    /// The tree node for path, if it holds any models.
+    pub fn folder(&self, path: &Path) -> Option<&FolderNode> {
+        self.folder_tree.iter().find_map(|root| root.find(path))
+    }
+
+    /// The imported folder that path lies in.
+    pub fn folder_root(&self, path: &Path) -> Option<&Path> {
+        self.folder_tree
+            .iter()
+            .map(|root| root.path.as_path())
+            .find(|root| path.starts_with(root))
     }
 
     pub fn collection(&self) -> &Collection {
@@ -219,20 +267,91 @@ impl Session {
     // ---- background work ----
 
     pub(crate) fn start_import(&mut self, folder: PathBuf) {
+        self.start_scan(folder, ScanKind::Import);
+    }
+
+    /// Rescans `folder` (an imported folder or one inside it) and syncs the catalog with it.
+    pub(crate) fn start_refresh(&mut self, folder: PathBuf) -> Result<(), String> {
+        let root = self
+            .folder_root(&folder)
+            .ok_or_else(|| format!("{} is not inside an imported folder", folder.display()))?
+            .to_owned();
+        if self.scans.iter().any(|s| s.folder == folder) {
+            return Ok(()); // already refreshing
+        }
+        self.start_scan(folder, ScanKind::Refresh { root });
+        Ok(())
+    }
+
+    fn start_scan(&mut self, folder: PathBuf, kind: ScanKind) {
         let (tx, rx) = mpsc::channel();
+        let scan_dir = folder.clone();
         let spawned = std::thread::Builder::new()
             .name("polyroom-scan".into())
             .spawn(move || {
-                let files = polyroom_catalog::scan_folder(&folder);
-                let _ = tx.send((folder, files));
+                let _ = tx.send(polyroom_catalog::scan_folder(&scan_dir));
             });
         match spawned {
             Ok(_) => {
-                self.scans.push(rx);
-                self.status = "Scanning folder…".into();
+                self.status = format!("Scanning {}…", folder.display());
+                self.scans.push(Scan {
+                    folder,
+                    kind,
+                    result: rx,
+                });
             }
-            Err(e) => self.status = format!("Could not start import: {e}"),
+            Err(e) => self.status = format!("Could not start scanning: {e}"),
         }
+    }
+
+    fn finish_refresh(&mut self, root: &Path, folder: &Path, files: Vec<ScannedFile>) {
+        let name = folder.file_name().map_or_else(
+            || folder.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let report = match self.catalog.sync(root, folder, files) {
+            Ok(report) => report,
+            Err(e) => {
+                self.status = format!("Refreshing {name} failed: {e}");
+                return;
+            }
+        };
+        // Changed files need new thumbnails and, if open, a fresh mesh in the loupe.
+        for id in &report.updated {
+            self.thumbnail_failed.remove(id);
+            if self.loupe.id == Some(*id) {
+                self.loupe = Loupe::default();
+            }
+        }
+        self.stale_thumbnails.extend(&report.updated);
+        self.status = if report == SyncReport::default() {
+            format!("{name} is up to date")
+        } else {
+            format!(
+                "Refreshed {name}: {} added, {} removed, {} changed",
+                report.added,
+                report.removed.len(),
+                report.updated.len()
+            )
+        };
+        self.refresh_visible();
+        // If the folder being browsed is gone, go to the nearest folder that still exists.
+        if let Collection::Folder(current) = &self.collection
+            && self.folder(current).is_none()
+        {
+            let fallback = current
+                .ancestors()
+                .find(|p| self.folder(p).is_some())
+                .unwrap_or(root)
+                .to_owned();
+            self.collection = Collection::Folder(fallback);
+            self.refresh_visible();
+        }
+    }
+
+    /// Models whose thumbnails went stale (file changed); the UI drops its cached images.
+    pub fn take_stale_thumbnails(&mut self) -> Vec<ModelId> {
+        std::mem::take(&mut self.stale_thumbnails)
     }
 
     /// Runs `op` against the catalog, reporting a failed save in the status bar.
@@ -275,16 +394,19 @@ impl Session {
     /// Collects background results and keeps derived state up to date. Call once per frame.
     pub fn poll(&mut self) {
         let mut finished = Vec::new();
-        self.scans.retain(|rx| match rx.try_recv() {
-            Ok(result) => {
-                finished.push(result);
+        self.scans.retain(|scan| match scan.result.try_recv() {
+            Ok(files) => {
+                finished.push((scan.folder.clone(), scan.kind.clone(), files));
                 false
             }
             Err(mpsc::TryRecvError::Empty) => true,
             Err(mpsc::TryRecvError::Disconnected) => false,
         });
-        for (folder, files) in finished {
-            self.finish_import(&folder, files);
+        for (folder, kind, files) in finished {
+            match kind {
+                ScanKind::Import => self.finish_import(&folder, files),
+                ScanKind::Refresh { root } => self.finish_refresh(&root, &folder, files),
+            }
         }
 
         let events = self
@@ -349,7 +471,7 @@ impl Session {
                     _ => format!("Imported {added} models from {}", folder.display()),
                 };
                 if added > 0 {
-                    self.collection = Collection::PreviousImport;
+                    self.collection = Collection::Folder(folder.to_owned());
                     self.filter.clear();
                     self.refresh_visible();
                     self.current = self.visible.first().copied();
@@ -400,7 +522,12 @@ impl Session {
             .split_whitespace()
             .map(str::to_lowercase)
             .collect();
+        if self.visible_for.as_ref().map(|k| k.0) != Some(key.0) {
+            self.folder_tree = folders::build(self.catalog.folders(), self.catalog.models());
+        }
         let last_import = self.catalog.last_import();
+        // In a folder: only its own models, unless searching, which looks in subfolders too.
+        let searching = !words.is_empty();
         self.visible = self
             .catalog
             .models()
@@ -408,7 +535,8 @@ impl Session {
             .filter(|m| match &self.collection {
                 Collection::All => true,
                 Collection::PreviousImport => m.import == last_import,
-                Collection::Folder(f) => &m.folder == f,
+                Collection::Folder(f) if searching => m.path.starts_with(f),
+                Collection::Folder(f) => m.path.parent() == Some(f.as_path()),
             })
             .filter(|m| {
                 let name = m.name().to_lowercase();
@@ -416,6 +544,13 @@ impl Session {
             })
             .map(|m| m.id)
             .collect();
+        self.visible_folders = match &self.collection {
+            Collection::Folder(f) if !searching => self
+                .folder(f)
+                .map(|n| n.children.iter().map(|c| c.path.clone()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         self.visible_for = Some(key);
         // Drop selection that is no longer visible.
         let visible: HashSet<ModelId> = self.visible.iter().copied().collect();

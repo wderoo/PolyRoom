@@ -3,7 +3,7 @@
 use polyroom_engine::{Command, CommandRegistry, Session};
 
 /// Top-level menus in display order. Commands under other roots are appended after these.
-const ROOT_ORDER: &[&str] = &["File", "View", "Window", "Help"];
+const ROOT_ORDER: &[&str] = &["File", "Edit", "Library", "Model", "View", "Window", "Help"];
 
 /// Draws the menu bar. Returns the id of the command the user clicked, if any.
 pub fn menu_bar(

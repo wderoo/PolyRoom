@@ -1,5 +1,7 @@
 //! The thumbnail grid and the filmstrip.
 
+use std::path::{Path, PathBuf};
+
 use egui::{
     Align2, Color32, CornerRadius, FontId, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, pos2,
     vec2,
@@ -91,16 +93,20 @@ pub fn grid(
     let cols = ((width + GAP) / (cell.x + GAP)).floor().max(1.0) as usize;
     session.grid_columns = cols;
     let ids: Vec<ModelId> = session.visible().to_vec();
-    let rows = ids.len().div_ceil(cols);
+    // Subfolders come first, like in a file manager.
+    let folders: Vec<PathBuf> = session.visible_folders().to_vec();
+    let total = folders.len() + ids.len();
+    let rows = total.div_ceil(cols);
     let row_height = cell.y + GAP;
 
     // Centre the columns horizontally.
     let used = cols as f32 * (cell.x + GAP) - GAP;
     let margin = ((width - used) / 2.0).max(0.0) + GAP / 2.0;
 
+    // Each folder keeps its own scroll position.
     let mut area = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .id_salt("grid");
+        .id_salt(("grid", session.collection().clone()));
     // Only once the viewport size is known (not on the very first frame).
     if session.current() != state.last_current && state.viewport_height > 0.0 {
         state.last_current = session.current();
@@ -108,7 +114,7 @@ pub fn grid(
             .current()
             .and_then(|c| ids.iter().position(|&i| i == c))
         {
-            let top = (pos / cols) as f32 * row_height;
+            let top = ((pos + folders.len()) / cols) as f32 * row_height;
             if top < state.offset {
                 area = area.vertical_scroll_offset(top);
             } else if top + row_height > state.offset + state.viewport_height {
@@ -123,8 +129,15 @@ pub fn grid(
             ui.horizontal(|ui| {
                 ui.add_space(margin);
                 ui.spacing_mut().item_spacing.x = GAP;
-                for &id in ids.iter().skip(row * cols).take(cols) {
-                    grid_cell(ui, id, cell, session, thumbs, actions);
+                for i in (row * cols)..((row + 1) * cols).min(total) {
+                    match folders.get(i) {
+                        Some(path) => folder_cell(ui, path, cell, session, thumbs, actions),
+                        None => {
+                            if let Some(&id) = ids.get(i - folders.len()) {
+                                grid_cell(ui, id, cell, session, thumbs, actions);
+                            }
+                        }
+                    }
                 }
             });
             ui.add_space(GAP / 2.0);
@@ -132,6 +145,89 @@ pub fn grid(
     });
     state.offset = output.state.clamped_offset().y;
     state.viewport_height = output.inner_rect.height();
+}
+
+/// A subfolder: a folder shape holding up to four thumbnails from inside it.
+/// Double-click opens it.
+fn folder_cell(
+    ui: &mut Ui,
+    path: &Path,
+    size: egui::Vec2,
+    session: &mut Session,
+    thumbs: &mut ThumbTextures,
+    actions: &mut Actions,
+) {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    if response.double_clicked() {
+        actions.push_args("library.show_folder", json!({ "path": path }));
+    }
+    let Some(node) = session.folder(path).cloned() else {
+        return;
+    };
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(3),
+        cell_fill(false, response.hovered()),
+    );
+
+    // Folder shape: a back panel with a tab, and a front panel.
+    let pad = 10.0;
+    let w = rect.width() - 2.0 * pad;
+    let body = Rect::from_min_size(rect.min + vec2(pad, pad + w * 0.12), vec2(w, w * 0.78));
+    let tab = Rect::from_min_size(
+        rect.min + vec2(pad, pad + w * 0.04),
+        vec2(w * 0.38, w * 0.12),
+    );
+    let back = Color32::from_rgb(0x8a, 0x6a, 0x3c);
+    let front = Color32::from_rgb(0xc8, 0x9a, 0x55);
+    painter.rect_filled(tab, CornerRadius::same(4), back);
+    painter.rect_filled(body, CornerRadius::same(4), back);
+    let face = Rect::from_min_max(body.min + vec2(0.0, w * 0.08), body.max);
+    painter.rect_filled(face, CornerRadius::same(4), front);
+
+    // Up to four sample thumbnails on the front, in a 2×2 grid.
+    let inner = face.shrink(w * 0.06);
+    let half = (inner.size() - vec2(4.0, 4.0)) / 2.0;
+    for (k, id) in node.samples.iter().enumerate() {
+        let col = (k % 2) as f32;
+        let row = (k / 2) as f32;
+        let slot = Rect::from_min_size(
+            inner.min + vec2(col * (half.x + 4.0), row * (half.y + 4.0)),
+            half,
+        );
+        let side = slot.width().min(slot.height());
+        let square = Rect::from_center_size(slot.center(), vec2(side, side));
+        painter.rect_filled(slot, CornerRadius::same(2), Color32::from_black_alpha(40));
+        thumbnail(ui, square, *id, session, thumbs);
+    }
+
+    let caption = pos2(rect.left() + pad - 4.0, rect.top() + rect.width() - 2.0);
+    let galley = painter.layout_no_wrap(node.name.clone(), FontId::proportional(12.0), theme::TEXT);
+    painter
+        .with_clip_rect(Rect::from_min_size(caption, vec2(rect.width() - pad, 16.0)))
+        .galley(caption, galley, theme::TEXT);
+    let count = crate::format::models(node.total as u64);
+    painter.text(
+        pos2(caption.x, rect.bottom() - 8.0),
+        Align2::LEFT_BOTTOM,
+        count,
+        FontId::proportional(11.0),
+        theme::TEXT_DIM,
+    );
+    response.context_menu(|ui| crate::tree::folder_menu(ui, path, actions));
+    // "⋯" in the top-right corner, also opening the folder menu.
+    let dots = Rect::from_min_size(
+        pos2(rect.right() - 30.0, rect.top() + 4.0),
+        vec2(26.0, 18.0),
+    );
+    let hovered = ui.rect_contains_pointer(rect);
+    let dots_id = ui.make_persistent_id(("cell-dots", path));
+    crate::tree::dots_button(ui, dots, dots_id, path, hovered, actions);
+    response.on_hover_text(format!("{}\nDouble-click to open", node.path.display()));
 }
 
 fn grid_cell(

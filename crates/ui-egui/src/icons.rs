@@ -71,6 +71,25 @@ pub fn reject_mark(painter: &Painter, rect: Rect, color: Color32) {
     painter.line_segment([c + vec2(-d, d), c + vec2(d, -d)], Stroke::new(1.5, color));
 }
 
+/// Three horizontal dots (a "more actions" button).
+pub fn dots(painter: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let gap = rect.width().min(rect.height()) * 0.26;
+    for dx in [-gap, 0.0, gap] {
+        painter.circle_filled(c + vec2(dx, 0.0), 1.6, color);
+    }
+}
+
+/// An upward arrow (for "up one folder").
+pub fn up_arrow(painter: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let h = rect.height() * 0.32;
+    let stroke = Stroke::new(1.8, color);
+    painter.line_segment([c + vec2(0.0, h), c + vec2(0.0, -h)], stroke);
+    painter.line_segment([c + vec2(-h * 0.8, -h * 0.1), c + vec2(0.0, -h)], stroke);
+    painter.line_segment([c + vec2(h * 0.8, -h * 0.1), c + vec2(0.0, -h)], stroke);
+}
+
 pub fn label_color(label: ColorLabel) -> Color32 {
     match label {
         ColorLabel::Red => Color32::from_rgb(0xd9, 0x4c, 0x4c),

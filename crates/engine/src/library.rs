@@ -18,6 +18,36 @@ fn arg_str<'a>(command: &str, args: &'a Value, key: &str) -> Result<&'a str, Eng
         })
 }
 
+/// The folder being browsed, if any.
+fn current_folder(s: &Session) -> Option<PathBuf> {
+    match s.collection() {
+        Collection::Folder(p) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+/// `{"path": "..."}`, or the folder being browsed when no path is given (menu, shortcut).
+fn folder_arg(command: &str, s: &Session, args: &Value) -> Result<PathBuf, EngineError> {
+    match args.get("path") {
+        Some(_) => arg_str(command, args, "path").map(PathBuf::from),
+        None => current_folder(s).ok_or_else(|| EngineError::InvalidArgument {
+            command: command.into(),
+            reason: "no folder given and none is open".into(),
+        }),
+    }
+}
+
+/// The folder above the one being browsed, if that is still inside its imported folder.
+fn parent_folder(s: &Session) -> Option<PathBuf> {
+    let Collection::Folder(current) = s.collection() else {
+        return None;
+    };
+    let root = s.folder_root(current)?;
+    (current.as_path() != root)
+        .then(|| current.parent().map(PathBuf::from))
+        .flatten()
+}
+
 fn has_target(s: &Session) -> bool {
     s.current.is_some() || !s.selection.is_empty()
 }
@@ -156,9 +186,17 @@ pub fn register(r: &mut CommandRegistry) {
     });
 
     // What the grid shows.
-    simple!(r, "library.show_all", "All Models", "", None, always, |s| {
-        s.collection = Collection::All;
-    });
+    simple!(
+        r,
+        "library.show_all",
+        "All Models",
+        "Library/All Models",
+        None,
+        always,
+        |s| {
+            s.collection = Collection::All;
+        }
+    );
     simple!(
         r,
         "library.show_previous_import",
@@ -179,6 +217,47 @@ pub fn register(r: &mut CommandRegistry) {
         run: |s, args| {
             let path = arg_str("library.show_folder", args, "path")?;
             s.collection = Collection::Folder(PathBuf::from(path));
+            Ok(())
+        },
+    });
+    r.register(Command {
+        id: "library.refresh_folder",
+        label: "Refresh Folder",
+        menu: "Library/Refresh Folder",
+        shortcut: Some(Shortcut::key(Key::F5)),
+        enabled: |s| current_folder(s).is_some(),
+        run: |s, args| {
+            let folder = folder_arg("library.refresh_folder", s, args)?;
+            s.start_refresh(folder)
+                .map_err(|reason| EngineError::InvalidArgument {
+                    command: "library.refresh_folder".into(),
+                    reason,
+                })
+        },
+    });
+    r.register(Command {
+        id: "library.show_in_explorer",
+        label: "Show in Explorer",
+        menu: "Library/Show in Explorer",
+        shortcut: None,
+        enabled: |s| current_folder(s).is_some(),
+        run: |s, args| {
+            let folder = folder_arg("library.show_in_explorer", s, args)?;
+            s.request(crate::Request::ShowInExplorer(folder));
+            Ok(())
+        },
+    });
+    r.register(Command {
+        id: "library.folder_up",
+        label: "Up One Folder",
+        menu: "Library/Up One Folder",
+        shortcut: Some(Shortcut::key(Key::Backspace)),
+        enabled: |s| parent_folder(s).is_some(),
+        run: |s, _| {
+            if let Some(parent) = parent_folder(s) {
+                s.collection = Collection::Folder(parent);
+                s.view = crate::ViewMode::Grid;
+            }
             Ok(())
         },
     });
@@ -529,6 +608,125 @@ mod tests {
         s.poll();
         assert!(s.visible().is_empty());
         assert_eq!(s.collection(), &Collection::Folder("C:/elsewhere".into()));
+    }
+
+    #[test]
+    fn folders_show_own_models_and_subfolders() {
+        let r = default_registry();
+        let mut s = session_with(&[
+            "top.stl",
+            "Halloween/ghost.stl",
+            "Halloween/skeleton/arm.stl",
+        ]);
+        r.run("library.show_folder", &mut s, &json!({"path": "C:/m"}))
+            .unwrap();
+        s.poll();
+        assert_eq!(s.visible().len(), 1);
+        assert_eq!(s.visible_folders(), [Path::new("C:/m/Halloween")]);
+        assert!(
+            !r.is_enabled("library.folder_up", &s),
+            "can't go above the import"
+        );
+
+        r.run(
+            "library.show_folder",
+            &mut s,
+            &json!({"path": "C:/m/Halloween/skeleton"}),
+        )
+        .unwrap();
+        s.poll();
+        assert_eq!(s.visible().len(), 1);
+        assert!(s.visible_folders().is_empty());
+        r.run("library.folder_up", &mut s, &json!(null)).unwrap();
+        s.poll();
+        assert_eq!(s.collection(), &Collection::Folder("C:/m/Halloween".into()));
+
+        // Searching a folder includes its subfolders and hides the folder cells.
+        r.run("library.show_folder", &mut s, &json!({"path": "C:/m"}))
+            .unwrap();
+        r.run("library.filter", &mut s, &json!({"text": "arm"}))
+            .unwrap();
+        s.poll();
+        assert_eq!(s.visible().len(), 1);
+        assert!(s.visible_folders().is_empty());
+    }
+
+    #[test]
+    fn refresh_syncs_a_real_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        for f in ["a.stl", "sub/b.stl", "sub/c.stl"] {
+            std::fs::write(root.join(f), b"x").unwrap();
+        }
+        let r = default_registry();
+        let mut s = Session::new();
+        r.run("library.import", &mut s, &json!({"path": root}))
+            .unwrap();
+        wait_for_scans(&mut s);
+        assert_eq!(s.catalog().models().len(), 3);
+
+        // Change the disk: delete c, add d; then refresh the open "sub" folder via F5's command.
+        std::fs::remove_file(root.join("sub/c.stl")).unwrap();
+        std::fs::write(root.join("sub/d.stl"), b"x").unwrap();
+        r.run(
+            "library.show_folder",
+            &mut s,
+            &json!({"path": root.join("sub")}),
+        )
+        .unwrap();
+        r.run("library.refresh_folder", &mut s, &json!(null))
+            .unwrap();
+        wait_for_scans(&mut s);
+        let mut names: Vec<_> = s.catalog().models().iter().map(|m| m.name()).collect();
+        names.sort();
+        assert_eq!(names, ["a.stl", "b.stl", "d.stl"]);
+        assert!(s.status().contains("1 added, 1 removed"), "{}", s.status());
+
+        // A folder outside every import is refused.
+        assert!(
+            r.run(
+                "library.refresh_folder",
+                &mut s,
+                &json!({"path": "Z:/nowhere"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn refreshing_a_deleted_folder_falls_back_to_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("gone")).unwrap();
+        std::fs::write(root.join("keep.stl"), b"x").unwrap();
+        std::fs::write(root.join("gone/x.stl"), b"x").unwrap();
+        let r = default_registry();
+        let mut s = Session::new();
+        r.run("library.import", &mut s, &json!({"path": root}))
+            .unwrap();
+        wait_for_scans(&mut s);
+        r.run(
+            "library.show_folder",
+            &mut s,
+            &json!({"path": root.join("gone")}),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(root.join("gone")).unwrap();
+        r.run("library.refresh_folder", &mut s, &json!(null))
+            .unwrap();
+        wait_for_scans(&mut s);
+        assert_eq!(s.collection(), &Collection::Folder(root.to_owned()));
+        assert_eq!(s.catalog().models().len(), 1);
+    }
+
+    fn wait_for_scans(s: &mut Session) {
+        let start = std::time::Instant::now();
+        while s.is_busy() && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            s.poll();
+        }
+        s.poll();
     }
 
     #[test]

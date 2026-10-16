@@ -15,6 +15,15 @@ pub fn count(n: u64) -> String {
     out
 }
 
+/// 1 model, 2 models, 1,234 models.
+pub fn models(n: u64) -> String {
+    if n == 1 {
+        "1 model".to_owned()
+    } else {
+        format!("{} models", count(n))
+    }
+}
+
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = n as f64;
@@ -82,5 +91,7 @@ mod tests {
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(1_760_572_800), "2025-10-16");
         assert_eq!(volume(1000.0), "1.0 cm³");
+        assert_eq!(models(1), "1 model");
+        assert_eq!(models(1500), "1,500 models");
     }
 }

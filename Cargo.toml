@@ -44,6 +44,7 @@ pollster = "1"
 eframe = { version = "0.37", features = ["persistence"] }
 egui = "0.37"
 egui-wgpu = "0.37"
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
 rfd = "0.17"
 
 # xtask

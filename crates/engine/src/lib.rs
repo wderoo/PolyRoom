@@ -8,11 +8,13 @@
 mod command;
 mod commands;
 mod error;
+mod folders;
 mod library;
 mod session;
 
 pub use command::{Command, CommandRegistry, Key, Shortcut};
 pub use error::EngineError;
+pub use folders::FolderNode;
 pub use polyroom_catalog::{Catalog, ColorLabel, Flag, Model, ModelId};
 pub use polyroom_formats::Format;
 pub use polyroom_mesh::{Mesh, MeshStats};

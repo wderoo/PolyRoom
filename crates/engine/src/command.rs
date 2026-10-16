@@ -8,6 +8,7 @@ pub enum Key {
     Char(char),
     Enter,
     Escape,
+    Backspace,
     Tab,
     Left,
     Right,
@@ -15,6 +16,7 @@ pub enum Key {
     Down,
     Plus,
     Minus,
+    F5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,6 +68,7 @@ impl Shortcut {
             Key::Char(c) => out.extend(c.to_uppercase()),
             Key::Enter => out.push_str("Enter"),
             Key::Escape => out.push_str("Esc"),
+            Key::Backspace => out.push_str("Backspace"),
             Key::Tab => out.push_str("Tab"),
             Key::Left => out.push('←'),
             Key::Right => out.push('→'),
@@ -73,6 +76,7 @@ impl Shortcut {
             Key::Down => out.push('↓'),
             Key::Plus => out.push('+'),
             Key::Minus => out.push('-'),
+            Key::F5 => out.push_str("F5"),
         }
         out
     }

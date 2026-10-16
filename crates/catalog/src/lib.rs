@@ -151,9 +151,24 @@ pub enum Op {
         id: ModelId,
         error: Option<String>,
     },
+    /// The file changed on disk: new size/date, and stats must be recomputed.
+    UpdateFile {
+        id: ModelId,
+        size: u64,
+        modified: Option<u64>,
+    },
     Remove {
         id: ModelId,
     },
+}
+
+/// What [`Catalog::sync`] changed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncReport {
+    pub added: usize,
+    pub removed: Vec<ModelId>,
+    /// Models whose file changed; their thumbnails are stale.
+    pub updated: Vec<ModelId>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -329,6 +344,14 @@ impl Catalog {
                     m.error = error;
                 }
             }
+            Op::UpdateFile { id, size, modified } => {
+                if let Some(m) = self.get_mut(id) {
+                    m.size = size;
+                    m.modified = modified;
+                    m.stats = None;
+                    m.error = None;
+                }
+            }
             Op::Remove { id } => {
                 if let Some(i) = self.index.remove(&id) {
                     self.models.remove(i);
@@ -418,6 +441,44 @@ impl Catalog {
             })?;
         }
         Ok(count)
+    }
+
+    /// Brings the models under `scope` in line with `files`, a fresh scan of `scope`. `scope`
+    /// is the imported folder `root` or a folder inside it. Ratings, flags and labels of
+    /// unchanged and changed files are kept; deleted files are dropped; new files are added.
+    pub fn sync(
+        &mut self,
+        root: &Path,
+        scope: &Path,
+        files: Vec<ScannedFile>,
+    ) -> Result<SyncReport, CatalogError> {
+        let on_disk: HashMap<&Path, &ScannedFile> =
+            files.iter().map(|f| (f.path.as_path(), f)).collect();
+        let mut report = SyncReport::default();
+        let mut updates = Vec::new();
+        for m in self.models.iter().filter(|m| m.path.starts_with(scope)) {
+            match on_disk.get(m.path.as_path()) {
+                None => report.removed.push(m.id),
+                Some(f) if f.size != m.size || f.modified != m.modified => {
+                    updates.push(Op::UpdateFile {
+                        id: m.id,
+                        size: f.size,
+                        modified: f.modified,
+                    });
+                    report.updated.push(m.id);
+                }
+                Some(_) => {}
+            }
+        }
+        for &id in &report.removed {
+            self.apply(Op::Remove { id })?;
+        }
+        for op in updates {
+            self.apply(op)?;
+        }
+        // `import` skips files that are already in the catalog.
+        report.added = self.import(root, files)?;
+        Ok(report)
     }
 }
 
@@ -520,6 +581,58 @@ mod tests {
         let c = Catalog::open(dir.path()).unwrap();
         assert!(c.models().is_empty());
         assert!(dir.path().join("snapshot.corrupt.json").exists());
+    }
+
+    #[test]
+    fn sync_adds_removes_and_updates_within_scope_only() {
+        let mut c = Catalog::in_memory();
+        let root = Path::new("C:/models");
+        let in_sub = |n: &str| ScannedFile {
+            path: root.join("sub").join(n),
+            ..file(n)
+        };
+        c.import(
+            root,
+            vec![file("top.stl"), in_sub("a.stl"), in_sub("b.stl")],
+        )
+        .unwrap();
+        c.apply(Op::SetRating { id: 1, rating: 5 }).unwrap();
+        c.apply(Op::SetStats {
+            id: 1,
+            stats: polyroom_mesh::test_cube().stats().unwrap(),
+        })
+        .unwrap();
+
+        // On disk now: a.stl changed, b.stl deleted, c.stl new. top.stl is outside the scope.
+        let changed = ScannedFile {
+            size: 999,
+            ..in_sub("a.stl")
+        };
+        let report = c
+            .sync(root, &root.join("sub"), vec![changed, in_sub("c.stl")])
+            .unwrap();
+        assert_eq!(report.added, 1);
+        assert_eq!(report.removed, vec![2]);
+        assert_eq!(report.updated, vec![1]);
+
+        let a = c.get(1).unwrap();
+        assert_eq!((a.size, a.rating, a.stats), (999, 5, None)); // rating kept, stats stale
+        assert!(c.get(2).is_none());
+        assert!(c.get(0).is_some(), "files outside the scope are untouched");
+        assert_eq!(c.models().len(), 3);
+
+        // Nothing changed: an empty report.
+        let again = vec![
+            ScannedFile {
+                size: 999,
+                ..in_sub("a.stl")
+            },
+            in_sub("c.stl"),
+        ];
+        assert_eq!(
+            c.sync(root, &root.join("sub"), again).unwrap(),
+            SyncReport::default()
+        );
     }
 
     #[test]

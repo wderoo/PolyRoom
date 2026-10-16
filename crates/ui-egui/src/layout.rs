@@ -1,12 +1,10 @@
 //! The Lightroom-style window layout: module bar, side panels, centre view and filmstrip.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-
 use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Ui, vec2};
 use polyroom_engine::{Collection, ColorLabel, Flag, Module, Session, ViewMode};
 use serde_json::{Value, json};
 
+use crate::tree::{self, TreeState};
 use crate::{format, icons, theme};
 
 /// Commands requested while drawing; dispatched by the app after the frame.
@@ -72,32 +70,34 @@ fn counted_row(ui: &mut Ui, selected: bool, label: &str, count: usize) -> egui::
     ui.add(
         egui::Button::selectable(selected, label)
             .right_text(RichText::new(count.to_string()).color(theme::TEXT_DIM))
+            .truncate()
             .min_size(vec2(ui.available_width(), 0.0)),
     )
 }
 
-pub fn left_panel(ui: &mut Ui, session: &mut Session, actions: &mut Actions) {
+pub fn left_panel(
+    ui: &mut Ui,
+    session: &Session,
+    tree_state: &mut TreeState,
+    actions: &mut Actions,
+) {
     // Counts are cheap to compute even for tens of thousands of models.
     let models = session.catalog().models();
     let last_import = session.catalog().last_import();
     let total = models.len();
     let previous = models.iter().filter(|m| m.import == last_import).count();
-    let mut per_folder: HashMap<&PathBuf, usize> = HashMap::new();
-    for m in models {
-        *per_folder.entry(&m.folder).or_default() += 1;
-    }
-    let folders: Vec<(PathBuf, usize)> = session
-        .catalog()
-        .folders()
-        .iter()
-        .map(|f| (f.clone(), per_folder.get(f).copied().unwrap_or(0)))
-        .collect();
     let collection = session.collection().clone();
+    let current_folder = match &collection {
+        Collection::Folder(p) => Some(p.as_path()),
+        _ => None,
+    };
+    tree_state.track(&collection);
 
+    let mut open = session.panels.left;
     egui::Panel::left("left_panel")
-        .default_size(240.0)
-        .size_range(180.0..=420.0)
-        .show_collapsible(ui, &mut session.panels.left, |ui| {
+        .default_size(260.0)
+        .size_range(180.0..=480.0)
+        .show_collapsible(ui, &mut open, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 section(ui, "Catalog", |ui| {
                     if counted_row(ui, collection == Collection::All, "All Models", total).clicked()
@@ -116,26 +116,80 @@ pub fn left_panel(ui: &mut Ui, session: &mut Session, actions: &mut Actions) {
                     }
                 });
                 section(ui, "Folders", |ui| {
-                    if folders.is_empty() {
+                    if session.folder_tree().is_empty() {
                         ui.label(RichText::new("No folders imported").color(theme::TEXT_DIM));
                     }
-                    for (path, count) in &folders {
-                        let name = path.file_name().map_or_else(
-                            || path.display().to_string(),
-                            |n| n.to_string_lossy().into_owned(),
-                        );
-                        let selected = collection == Collection::Folder(path.clone());
-                        let response = counted_row(ui, selected, &name, *count)
-                            .on_hover_text(path.display().to_string());
-                        if response.clicked() {
-                            actions.push_args("library.show_folder", json!({ "path": path }));
-                        }
-                    }
+                    tree::folder_tree(
+                        ui,
+                        session.folder_tree(),
+                        current_folder,
+                        tree_state,
+                        actions,
+                    );
                     ui.add_space(4.0);
                     if ui.button("+ Import Folder…").clicked() {
                         actions.push("library.import_folder");
                     }
                 });
+            });
+        });
+    if open != session.panels.left {
+        actions.push("view.toggle_left_panel");
+    }
+}
+
+/// Clickable path segments for the folder being browsed: `3D › Halloween › skeleton`.
+pub fn breadcrumbs(ui: &mut Ui, session: &Session, actions: &mut Actions) {
+    let Collection::Folder(current) = session.collection() else {
+        return;
+    };
+    let Some(root) = session.folder_root(current) else {
+        return;
+    };
+    let mut crumbs: Vec<&std::path::Path> = current
+        .ancestors()
+        .take_while(|p| p.starts_with(root))
+        .collect();
+    crumbs.reverse();
+    Frame::new()
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, up) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                let enabled = crumbs.len() > 1;
+                let color = match (enabled, up.hovered()) {
+                    (false, _) => Color32::from_gray(0x50),
+                    (true, true) => theme::TEXT,
+                    (true, false) => theme::TEXT_DIM,
+                };
+                icons::up_arrow(ui.painter(), rect, color);
+                if enabled && up.on_hover_text("Up one folder (Backspace)").clicked() {
+                    actions.push("library.folder_up");
+                }
+                for (i, path) in crumbs.iter().enumerate() {
+                    if i > 0 {
+                        ui.label(RichText::new("›").color(theme::TEXT_DIM));
+                    }
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    let last = i + 1 == crumbs.len();
+                    let text = if last {
+                        RichText::new(name).strong().color(theme::TEXT)
+                    } else {
+                        RichText::new(name).color(theme::TEXT_DIM)
+                    };
+                    let crumb = ui.add(egui::Button::new(text).frame(false));
+                    if crumb.clicked() && !last {
+                        actions.push_args("library.show_folder", json!({ "path": path }));
+                    }
+                    crumb.context_menu(|ui| tree::folder_menu(ui, path, actions));
+                }
+                // Actions for the folder being browsed.
+                let (dots, _) = ui.allocate_exact_size(vec2(22.0, 18.0), Sense::hover());
+                let id = ui.make_persistent_id("crumb-dots");
+                tree::dots_button(ui, dots, id, current, true, actions);
             });
         });
 }
@@ -347,13 +401,11 @@ pub fn toolbar(ui: &mut Ui, session: &Session, filter: &mut String, actions: &mu
                 }
                 let total = session.visible().len();
                 let selected = session.selection_len();
+                let models = format::models(total as u64);
                 let counts = if selected > 1 {
-                    format!(
-                        "{} models · {selected} selected",
-                        format::count(total as u64)
-                    )
+                    format!("{models} · {selected} selected")
                 } else {
-                    format!("{} models", format::count(total as u64))
+                    models
                 };
                 ui.label(RichText::new(counts).color(theme::TEXT_DIM));
 
