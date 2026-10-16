@@ -1,0 +1,16 @@
+[package]
+name = "polyroom"
+description = "PolyRoom desktop app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+polyroom-ui-egui.workspace = true
+eframe.workspace = true
+env_logger.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

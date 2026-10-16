@@ -1,0 +1,21 @@
+[package]
+name = "polyroom-formats"
+description = "STL, OBJ and 3MF loaders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+polyroom-mesh.workspace = true
+glam.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

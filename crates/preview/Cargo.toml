@@ -1,0 +1,20 @@
+[package]
+name = "polyroom-preview"
+description = "Background model loading, stats and cached thumbnail rendering"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+polyroom-mesh.workspace = true
+polyroom-formats.workspace = true
+polyroom-render.workspace = true
+png.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

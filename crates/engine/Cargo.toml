@@ -1,0 +1,22 @@
+[package]
+name = "polyroom-engine"
+description = "PolyRoom session state and command registry (no UI dependencies)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+polyroom-mesh.workspace = true
+polyroom-formats.workspace = true
+polyroom-render.workspace = true
+polyroom-catalog.workspace = true
+polyroom-preview.workspace = true
+directories.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

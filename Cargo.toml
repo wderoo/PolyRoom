@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal
+polyroom-mesh = { path = "crates/mesh" }
+polyroom-formats = { path = "crates/formats" }
+polyroom-render = { path = "crates/render" }
+polyroom-catalog = { path = "crates/catalog" }
+polyroom-preview = { path = "crates/preview" }
+polyroom-engine = { path = "crates/engine" }
+polyroom-ui-egui = { path = "crates/ui-egui" }
+
+# Foundation
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+glam = { version = "0.34", features = ["serde"] }
+proptest = "1"
+directories = "6"
+walkdir = "2"
+tempfile = "3"
+
+# Formats
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+quick-xml = "0.42"
+png = "0.18"
+
+# GPU
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1"
+
+# UI (L5 only)
+eframe = { version = "0.37", features = ["persistence"] }
+egui = "0.37"
+egui-wgpu = "0.37"
+rfd = "0.17"
+
+# xtask
+toml = "0.9"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+
+[profile.dev.package."*"]
+# Dependencies (wgpu, mesh parsing) are painfully slow unoptimized.
+opt-level = 2
+
+[profile.release]
+lto = "thin"
