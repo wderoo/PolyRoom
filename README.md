@@ -10,6 +10,23 @@ with [egui](https://github.com/emilk/egui) and [wgpu](https://wgpu.rs).
   `G` grid, `E` loupe, `Tab` hide panels, `Ctrl+/` for all shortcuts.
 - Metadata: dimensions in mm, triangle count, volume and surface area.
 
+## Prerequisites (Windows)
+
+Install Rust and the MSVC linker with [winget](https://learn.microsoft.com/windows/package-manager/winget/).
+The C++ redistributable is not enough: building needs the linker from the Build Tools.
+
+```powershell
+winget install --id Rustlang.Rustup -e
+```
+
+```powershell
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--passive --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+Accept the UAC prompt for the second command. It installs only the C++ build tools (no IDE).
+Open a new terminal afterwards so `cargo` is on your `PATH`, then check with `cargo --version`.
+Rust 1.95 or newer is required. A GPU with Vulkan, DX12 or Metal support is needed to run the app.
+
 ## Build & run
 
 ```bash
