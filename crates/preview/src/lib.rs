@@ -191,6 +191,11 @@ impl PreviewService {
         self.pending_thumbs.contains(&id)
     }
 
+    /// How many thumbnails are queued or being made.
+    pub fn pending_thumbnails(&self) -> usize {
+        self.pending_thumbs.len()
+    }
+
     pub fn is_busy(&self) -> bool {
         !self.pending_thumbs.is_empty() || self.pending_mesh.is_some()
     }

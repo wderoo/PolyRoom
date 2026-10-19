@@ -720,6 +720,21 @@ mod tests {
         assert_eq!(s.catalog().models().len(), 1);
     }
 
+    #[test]
+    fn scanning_reports_indeterminate_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.stl"), b"x").unwrap();
+        let r = default_registry();
+        let mut s = Session::new();
+        assert!(s.progress().is_none());
+        r.run("library.import", &mut s, &json!({"path": dir.path()}))
+            .unwrap();
+        let p = s.progress().unwrap();
+        assert_eq!(p.fraction, None);
+        wait_for_scans(&mut s);
+        assert!(s.progress().is_none());
+    }
+
     fn wait_for_scans(s: &mut Session) {
         let start = std::time::Instant::now();
         while s.is_busy() && start.elapsed() < std::time::Duration::from_secs(10) {

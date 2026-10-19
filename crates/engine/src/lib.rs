@@ -10,6 +10,7 @@ mod commands;
 mod error;
 mod folders;
 mod library;
+mod progress;
 mod session;
 
 pub use command::{Command, CommandRegistry, Key, Shortcut};
@@ -19,6 +20,7 @@ pub use polyroom_catalog::{Catalog, ColorLabel, Flag, Model, ModelId};
 pub use polyroom_formats::Format;
 pub use polyroom_mesh::{Mesh, MeshStats};
 pub use polyroom_render::Image;
+pub use progress::Progress;
 pub use session::{Collection, Loupe, Module, Panels, Paths, Request, Session, ViewMode};
 
 /// Builds a registry with all built-in commands.

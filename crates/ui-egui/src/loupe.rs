@@ -5,7 +5,7 @@ use egui::{Align2, Color32, FontId, Rect, Sense, Ui, pos2, vec2};
 use polyroom_engine::{ModelId, Session};
 use polyroom_render::{Camera, GpuMesh, Renderer, Style, Target};
 
-use crate::theme;
+use crate::{gizmo, theme};
 
 /// The centre background colour (#1c1c1e), matching [`theme::CENTER`].
 const BACKGROUND: [f32; 4] = [28.0 / 255.0, 28.0 / 255.0, 30.0 / 255.0, 1.0];
@@ -156,6 +156,14 @@ impl LoupeView {
             painter.image(texture, rect, uv, tint);
         }
 
+        // Axis gizmo: shows the orientation and snaps the view to an axis when clicked.
+        if showing_current && let Some(camera) = &mut self.camera {
+            let center = rect.right_top() + vec2(-(gizmo::ARM + 34.0), gizmo::ARM + 34.0);
+            if let Some(axis) = gizmo::show(ui, center, camera) {
+                camera.look_along(axis);
+            }
+        }
+
         // Overlays.
         if loupe.loading || (!showing_current && loupe.error.is_none()) {
             centered(&painter, rect, "Loading model…");
@@ -179,7 +187,7 @@ impl LoupeView {
         painter.text(
             rect.left_bottom() + vec2(14.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "Drag to orbit · Right-drag to pan · Scroll to zoom · Double-click to reset",
+            "Drag to orbit · Right-drag to pan · Scroll to zoom · Double-click to reset · Click an axis to align",
             FontId::proportional(11.0),
             theme::TEXT_DIM,
         );

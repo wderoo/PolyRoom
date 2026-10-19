@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod format;
+mod gizmo;
 mod grid;
 mod icons;
 mod keys;
@@ -218,11 +219,7 @@ impl eframe::App for PolyRoomApp {
                     .inner_margin(Margin::symmetric(10, 3)),
             )
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(self.session.status())
-                        .color(theme::TEXT_DIM)
-                        .small(),
-                );
+                status_bar(ui, self.session.status(), self.session.progress().as_ref());
             });
         if self.session.module == Module::Library {
             let film_open = self.session.panels.filmstrip;
@@ -268,6 +265,81 @@ impl eframe::App for PolyRoomApp {
 
         if self.session.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+}
+
+/// The status line, with a progress bar (or spinner while the amount of work is unknown) at the
+/// right edge while background work runs.
+fn status_bar(ui: &mut egui::Ui, status: &str, progress: Option<&polyroom_engine::Progress>) {
+    const BAR: f32 = 260.0;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(status).color(theme::TEXT_DIM).small());
+        let Some(progress) = progress else {
+            return;
+        };
+        match progress.fraction {
+            Some(f) => {
+                let gap = ui.available_width() - BAR;
+                if gap > 0.0 {
+                    ui.add_space(gap);
+                }
+                // The unfilled track uses this colour; the default vanishes against the header.
+                ui.visuals_mut().extreme_bg_color = egui::Color32::from_gray(58);
+                ui.add(
+                    egui::ProgressBar::new(f)
+                        .desired_width(BAR.min(ui.available_width()))
+                        .desired_height(14.0)
+                        .text(RichText::new(&progress.text).small()),
+                );
+            }
+            None => {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.label(RichText::new(&progress.text).color(theme::TEXT_DIM).small());
+            }
+        }
+    });
+}
+
+/// Tests that render with the GPU take this lock: creating several wgpu devices at once crashes
+/// some drivers.
+#[cfg(test)]
+pub(crate) static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use egui_kittest::kittest::Queryable;
+    use polyroom_engine::Progress;
+
+    use super::*;
+
+    #[test]
+    fn progress_bar_is_drawn_at_the_right_edge_of_the_status_bar() {
+        let _gpu = crate::GPU_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let progress = Progress {
+            text: "Generating previews 120 / 400".into(),
+            fraction: Some(0.3),
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 30.0))
+            .build_ui(|ui| {
+                theme::apply(ui.ctx());
+                Frame::new()
+                    .fill(theme::HEADER)
+                    .inner_margin(Margin::symmetric(10, 3))
+                    .show(ui, |ui| {
+                        status_bar(ui, "4000 models in library", Some(&progress));
+                    });
+            });
+        harness.run();
+        // The bar's text is exposed to accessibility, so it is on screen.
+        harness.get_by_label_contains("Generating previews 120 / 400");
+        if let Ok(image) = harness.render() {
+            let out = std::env::temp_dir().join("polyroom_status_bar.png");
+            image.save(&out).unwrap();
+            eprintln!("rendered {}", out.display());
         }
     }
 }

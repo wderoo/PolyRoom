@@ -9,6 +9,14 @@ use polyroom_preview::{Event, PreviewService};
 use polyroom_render::Image;
 
 use crate::folders::{self, FolderNode};
+use crate::progress::{Progress, Tracker};
+
+/// Preview jobs an import keeps queued at once; the rest wait in the engine so that cells the
+/// user scrolls to are served first.
+/// Finished thumbnails handed to the UI per frame.
+const THUMBNAILS_PER_FRAME: usize = 8;
+
+const IMPORT_IN_FLIGHT: usize = 16;
 
 /// The top-level module, like Lightroom's Library/Develop switcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -143,6 +151,7 @@ pub struct Session {
     /// Thumbnails that failed this session; not retried until restart.
     thumbnail_failed: HashSet<ModelId>,
     scans: Vec<Scan>,
+    import_progress: Tracker,
     stale_thumbnails: Vec<ModelId>,
     status: String,
     requests: Vec<Request>,
@@ -261,7 +270,42 @@ impl Session {
 
     /// True while background work is running; the UI keeps repainting to pick up results.
     pub fn is_busy(&self) -> bool {
-        !self.scans.is_empty() || self.preview.as_ref().is_some_and(PreviewService::is_busy)
+        !self.scans.is_empty()
+            || !self.fresh_thumbnails.is_empty()
+            || self.import_progress.is_active()
+            || self.preview.as_ref().is_some_and(PreviewService::is_busy)
+    }
+
+    /// Overall progress of scanning and preview generation, if any is running.
+    pub fn progress(&self) -> Option<Progress> {
+        if !self.scans.is_empty() {
+            return Some(Progress {
+                text: "Scanning folders…".into(),
+                fraction: None,
+            });
+        }
+        self.import_progress.progress()
+    }
+
+    /// Requests previews for queued import models, a few at a time.
+    fn feed_import_previews(&mut self) {
+        while self
+            .preview
+            .as_ref()
+            .is_some_and(|p| p.pending_thumbnails() < IMPORT_IN_FLIGHT)
+        {
+            let Some(id) = self.import_progress.next() else {
+                break;
+            };
+            self.want_thumbnail(id);
+            let queued = self
+                .preview
+                .as_ref()
+                .is_some_and(|p| p.is_thumbnail_pending(id));
+            if !queued {
+                self.import_progress.finish(id);
+            }
+        }
     }
 
     // ---- background work ----
@@ -354,6 +398,17 @@ impl Session {
         std::mem::take(&mut self.stale_thumbnails)
     }
 
+    /// Runs `ops` against the catalog with a single log write.
+    fn apply_all(&mut self, ops: Vec<Op>) {
+        if ops.is_empty() {
+            return;
+        }
+        if let Err(e) = self.catalog.apply_all(ops) {
+            log::error!("{e}");
+            self.status = format!("Changes not saved: {e}");
+        }
+    }
+
     /// Runs `op` against the catalog, reporting a failed save in the status bar.
     pub(crate) fn apply(&mut self, op: Op) {
         if let Err(e) = self.catalog.apply(op) {
@@ -378,6 +433,7 @@ impl Session {
         }
         let need_stats = model.stats.is_none();
         preview.request_thumbnail(id, source(model), need_stats);
+        self.import_progress.track(id);
     }
 
     /// Whether a thumbnail can't be shown (bad file or rendering failure).
@@ -387,8 +443,10 @@ impl Session {
     }
 
     /// Thumbnails that finished since the last call.
+    /// A few at a time, so uploading them to the GPU can't stall a frame.
     pub fn take_thumbnails(&mut self) -> Vec<(ModelId, Image)> {
-        std::mem::take(&mut self.fresh_thumbnails)
+        let n = self.fresh_thumbnails.len().min(THUMBNAILS_PER_FRAME);
+        self.fresh_thumbnails.drain(..n).collect()
     }
 
     /// Collects background results and keeps derived state up to date. Call once per frame.
@@ -414,9 +472,17 @@ impl Session {
             .as_mut()
             .map(PreviewService::poll)
             .unwrap_or_default();
+        // Stats and errors are saved with one write per frame, not one per model.
+        let mut ops = Vec::new();
         for event in events {
+            match &event {
+                Event::Thumbnail { id, .. } | Event::Failed { id, .. } => {
+                    self.import_progress.finish(*id);
+                }
+                _ => {}
+            }
             match event {
-                Event::Stats { id, stats } => self.apply(Op::SetStats { id, stats }),
+                Event::Stats { id, stats } => ops.push(Op::SetStats { id, stats }),
                 Event::Thumbnail { id, image } => self.fresh_thumbnails.push((id, image)),
                 Event::Mesh { id, mesh } => {
                     if self.loupe.id == Some(id) {
@@ -443,7 +509,7 @@ impl Session {
                     }
                     self.thumbnail_failed.insert(id);
                     if bad_file {
-                        self.apply(Op::SetError {
+                        ops.push(Op::SetError {
                             id,
                             error: Some(error),
                         });
@@ -454,6 +520,8 @@ impl Session {
             }
         }
 
+        self.apply_all(ops);
+        self.feed_import_previews();
         self.refresh_visible();
         self.update_loupe();
     }
@@ -471,6 +539,16 @@ impl Session {
                     _ => format!("Imported {added} models from {}", folder.display()),
                 };
                 if added > 0 {
+                    if self.preview.is_some() {
+                        let last_import = self.catalog.last_import();
+                        let new_models = self
+                            .catalog
+                            .models()
+                            .iter()
+                            .filter(|m| m.import == last_import && m.error.is_none())
+                            .map(|m| m.id);
+                        self.import_progress.add(new_models);
+                    }
                     self.collection = Collection::Folder(folder.to_owned());
                     self.filter.clear();
                     self.refresh_visible();
@@ -510,7 +588,7 @@ impl Session {
     /// Recomputes the visible list if the catalog, collection or filter changed.
     pub(crate) fn refresh_visible(&mut self) {
         let key = (
-            self.catalog.version(),
+            self.catalog.layout_version(),
             self.collection.clone(),
             self.filter.clone(),
         );

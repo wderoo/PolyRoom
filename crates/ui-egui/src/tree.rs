@@ -86,6 +86,39 @@ pub fn folder_tree(
     state.reveal = None;
 }
 
+/// The row's label: the name, then (if given) the folder's location in a dimmed colour. The
+/// whole label is cut off with an ellipsis at `width`, so a long location goes first.
+fn row_label(
+    name: &str,
+    location: Option<&str>,
+    font: egui::FontId,
+    color: egui::Color32,
+    dim: egui::Color32,
+    width: f32,
+) -> LayoutJob {
+    let mut job = LayoutJob::single_section(
+        name.to_owned(),
+        TextFormat {
+            font_id: font.clone(),
+            color,
+            ..Default::default()
+        },
+    );
+    if let Some(location) = location {
+        job.append(
+            &format!("  {location}"),
+            0.0,
+            TextFormat {
+                font_id: font,
+                color: dim,
+                ..Default::default()
+            },
+        );
+    }
+    job.wrap = TextWrapping::truncate_at_width(width);
+    job
+}
+
 /// One tree row: `name …        count  ⋯`. Laid out by hand so that the count and the dots
 /// line up at the panel's right edge at every depth, and long names are truncated instead of
 /// widening the panel.
@@ -125,15 +158,24 @@ fn folder_row(ui: &mut Ui, n: &FolderNode, selected: bool, is_root: bool, action
         );
 
         let name_width = (count_pos.x - main.left() - 2.0 * PAD).max(0.0);
-        let mut job = LayoutJob::single_section(
-            n.name.clone(),
-            TextFormat {
-                font_id: font,
-                color: text_color,
-                ..Default::default()
-            },
+        // Imported folders also show their location, so same-named folders can be told apart.
+        let location = is_root
+            .then(|| n.path.parent().map(|p| p.display().to_string()))
+            .flatten()
+            .filter(|p| !p.is_empty());
+        let dim = if selected {
+            egui::Color32::from_white_alpha(140)
+        } else {
+            theme::TEXT_DIM
+        };
+        let job = row_label(
+            &n.name,
+            location.as_deref(),
+            font,
+            text_color,
+            dim,
+            name_width,
         );
-        job.wrap = TextWrapping::truncate_at_width(name_width);
         let name = painter.layout_job(job);
         let name_pos = pos2(main.left() + PAD, main.center().y - name.size().y / 2.0);
 
@@ -260,7 +302,34 @@ mod tests {
     }
 
     #[test]
+    fn root_label_shows_dimmed_location_and_truncates() {
+        let font = egui::FontId::proportional(14.0);
+        let (text, dim) = (egui::Color32::WHITE, egui::Color32::GRAY);
+        let job = row_label("Models", Some("D:/Prints"), font.clone(), text, dim, 400.0);
+        assert_eq!(job.text, "Models  D:/Prints");
+        assert_eq!(job.sections.len(), 2);
+        assert_eq!(job.sections[1].format.color, dim);
+
+        let plain = row_label("Models", None, font.clone(), text, dim, 400.0);
+        assert_eq!(plain.sections.len(), 1);
+
+        let long = "D:/a/very/long/path/that/cannot/possibly/fit/in/the/panel";
+        let mut galley_width = 0.0;
+        let mut ellipsized = false;
+        let harness_job = row_label("Models", Some(long), font, text, dim, 120.0);
+        egui::__run_test_ctx(|ctx| {
+            let galley = ctx.fonts_mut(|f| f.layout_job(harness_job.clone()));
+            galley_width = galley.size().x;
+            ellipsized = galley.elided;
+        });
+        assert!(ellipsized && galley_width <= 120.5, "width {galley_width}");
+    }
+
+    #[test]
     fn deep_rows_stay_inside_the_panel() {
+        let _gpu = crate::GPU_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const WIDTH: f32 = 260.0;
         let roots = library();
         let selections = [

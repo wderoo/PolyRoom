@@ -18,6 +18,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true
+polyroom-mesh.workspace = true
 
 [lints]
 workspace = true

@@ -3069,6 +3069,7 @@ dependencies = [
  "egui_kittest",
  "log",
  "polyroom-engine",
+ "polyroom-mesh",
  "polyroom-render",
  "rfd",
  "serde_json",

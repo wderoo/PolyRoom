@@ -189,6 +189,9 @@ pub struct Catalog {
     last_import: u32,
     /// Bumped on every change; lets views cache derived data.
     version: u64,
+    /// Bumped only when models or folders are added, removed or replaced, not on edits like
+    /// ratings or stats; lets views cache lists and trees.
+    layout_version: u64,
 }
 
 impl Catalog {
@@ -296,6 +299,28 @@ impl Catalog {
         Ok(())
     }
 
+    /// Like [`Catalog::apply`] for many ops, with a single write to the log.
+    pub fn apply_all(&mut self, ops: Vec<Op>) -> Result<(), CatalogError> {
+        let mut text = String::new();
+        for op in &ops {
+            text.push_str(&serde_json::to_string(op)?);
+            text.push('\n');
+        }
+        let count = ops.len();
+        for op in ops {
+            self.apply_in_memory(op);
+        }
+        if let Some(log) = &mut self.log {
+            let path = self.dir.as_deref().unwrap_or(Path::new(LOG));
+            log.write_all(text.as_bytes()).map_err(io_err(path))?;
+            self.ops_in_log += count;
+        }
+        if self.ops_in_log >= COMPACT_AFTER {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
     fn insert(&mut self, model: Model) {
         self.next_id = self.next_id.max(model.id + 1);
         self.last_import = self.last_import.max(model.import);
@@ -311,6 +336,12 @@ impl Catalog {
 
     fn apply_in_memory(&mut self, op: Op) {
         self.version += 1;
+        if matches!(
+            op,
+            Op::AddFolder { .. } | Op::AddModel { .. } | Op::UpdateFile { .. } | Op::Remove { .. }
+        ) {
+            self.layout_version += 1;
+        }
         match op {
             Op::AddFolder { path } => {
                 if !self.folders.contains(&path) {
@@ -389,6 +420,11 @@ impl Catalog {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Like [`Catalog::version`], but unchanged by edits that don't alter which models exist.
+    pub fn layout_version(&self) -> u64 {
+        self.layout_version
     }
 
     /// The import batch shown as "Previous Import" (0 if nothing was imported yet).
@@ -572,6 +608,37 @@ mod tests {
         drop(log);
         let c = Catalog::open(dir.path()).unwrap();
         assert_eq!(c.get(0).unwrap().rating, 3);
+    }
+
+    #[test]
+    fn batched_ops_persist_and_edits_leave_the_layout_version_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = polyroom_mesh::test_cube().stats().unwrap();
+        let layout = {
+            let mut c = Catalog::open(dir.path()).unwrap();
+            c.import(Path::new("C:/models"), vec![file("a.stl"), file("b.stl")])
+                .unwrap();
+            let (layout, version) = (c.layout_version(), c.version());
+            c.apply_all(vec![
+                Op::SetStats { id: 0, stats },
+                Op::SetStats { id: 1, stats },
+                Op::SetRating { id: 1, rating: 2 },
+            ])
+            .unwrap();
+            assert_eq!(
+                c.layout_version(),
+                layout,
+                "stats and ratings keep the layout"
+            );
+            assert_eq!(c.version(), version + 3);
+            layout
+        };
+        let c = Catalog::open(dir.path()).unwrap();
+        assert!(c.get(0).unwrap().stats.is_some() && c.get(1).unwrap().stats.is_some());
+        assert_eq!(c.get(1).unwrap().rating, 2);
+        let mut c = c;
+        c.apply(Op::Remove { id: 0 }).unwrap();
+        assert!(c.layout_version() > layout);
     }
 
     #[test]

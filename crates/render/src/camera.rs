@@ -62,6 +62,26 @@ impl Camera {
         self.right().cross(self.forward())
     }
 
+    /// Turns the camera to look at the target from the side `axis` points to (e.g. `[0, 0, 1]`
+    /// is a top view). Straight up or down keeps the current heading.
+    pub fn look_along(&mut self, axis: [f32; 3]) {
+        let a = Vec3::from(axis).normalize_or(Vec3::ZERO);
+        if a == Vec3::ZERO {
+            return;
+        }
+        self.pitch = a.z.asin().clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
+        if a.x.abs() > 1e-4 || a.y.abs() > 1e-4 {
+            self.yaw = a.y.atan2(a.x);
+        }
+    }
+
+    /// A world direction in camera terms: `[right, up, away]` components. Negative `away`
+    /// points towards the viewer.
+    pub fn view_dir(&self, dir: [f32; 3]) -> [f32; 3] {
+        let d = Vec3::from(dir);
+        [d.dot(self.right()), d.dot(self.up()), d.dot(self.forward())]
+    }
+
     /// Orbit by a drag of `dx`, `dy` logical pixels.
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx * 0.008;
@@ -125,6 +145,32 @@ mod tests {
         assert!(cam.pitch < std::f32::consts::FRAC_PI_2);
         assert!(cam.right().dot(cam.up()).abs() < 1e-5);
         assert!((cam.up().length() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn look_along_puts_the_eye_on_that_side() {
+        let mut cam = Camera::fit(&cube(), 1.0);
+        for axis in [
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ] {
+            cam.look_along(axis);
+            let dir = (cam.eye() - cam.target).normalize();
+            assert!(dir.dot(Vec3::from(axis)) > 0.999, "{axis:?}: {dir}");
+            assert!(cam.view_dir(axis)[2] < -0.999); // towards the viewer
+        }
+        // Top and bottom keep the heading and stay just short of the pole.
+        cam.look_along([0.0, -1.0, 0.0]);
+        let yaw = cam.yaw;
+        cam.look_along([0.0, 0.0, 1.0]);
+        assert_eq!(cam.yaw, yaw);
+        assert!(cam.view_dir([0.0, 0.0, 1.0])[2] < -0.99);
+        cam.look_along([0.0, 0.0, -1.0]);
+        assert!(cam.eye().z < cam.target.z);
+        cam.look_along([0.0, 0.0, 0.0]); // no direction: unchanged
+        assert!(cam.eye().z < cam.target.z);
     }
 
     #[test]
