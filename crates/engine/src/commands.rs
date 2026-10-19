@@ -152,6 +152,17 @@ pub fn register_all(r: &mut CommandRegistry) {
         },
     });
     r.register(Command {
+        id: "view.toggle_bed_grid",
+        label: "Bed Grid",
+        menu: "View/Bed Grid",
+        shortcut: Some(Shortcut::key(Key::Char('b'))),
+        enabled: always,
+        run: |s, _| {
+            s.show_bed_grid = !s.show_bed_grid;
+            Ok(())
+        },
+    });
+    r.register(Command {
         id: "view.thumb_size",
         label: "Set Thumbnail Size",
         menu: "",

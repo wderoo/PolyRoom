@@ -167,6 +167,9 @@ fn folder_cell(
     let Some(node) = session.folder(path).cloned() else {
         return;
     };
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{} folder", node.name))
+    });
     let painter = ui.painter_at(rect);
     painter.rect_filled(
         rect,
@@ -246,6 +249,7 @@ fn grid_cell(
     let Some(model) = session.model(id).cloned() else {
         return;
     };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, model.name()));
     let selected = session.is_selected(id);
     let current = session.current() == Some(id);
     let painter = ui.painter_at(rect);
@@ -357,6 +361,11 @@ pub fn filmstrip(
             let rect = Rect::from_min_size(origin + vec2(i as f32 * step, 0.0), size);
             let response = ui.interact(rect, ui.scope_id().with(("film", id)), Sense::click());
             cell_clicks(ui, &response, id, actions);
+            if let Some(model) = session.model(id) {
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::Role::Button, true, model.name())
+                });
+            }
             let selected = session.is_selected(id);
             ui.painter().rect_filled(
                 rect,
@@ -382,4 +391,246 @@ pub fn filmstrip(
     state.offset = output.state.clamped_offset().x;
     // For the horizontal strip, "viewport_height" holds the visible width.
     state.viewport_height = output.inner_rect.width();
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::accesskit::Role;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::{NodeT, Queryable};
+    use polyroom_engine::{CommandRegistry, ViewMode, default_registry};
+
+    use super::*;
+    use crate::test_support::imported;
+
+    struct App {
+        session: Session,
+        registry: CommandRegistry,
+        thumbs: ThumbTextures,
+        grid: GridState,
+        film: GridState,
+    }
+
+    impl App {
+        /// Dispatches what the frame asked for, like `PolyRoomApp::dispatch` does.
+        fn run(&mut self, actions: Actions) {
+            for (id, args) in actions.list {
+                self.registry.run(id, &mut self.session, &args).unwrap();
+            }
+            self.session.poll();
+        }
+
+        fn current_name(&self) -> Option<String> {
+            let id = self.session.current()?;
+            Some(self.session.model(id)?.name())
+        }
+    }
+
+    /// 30 models in the root and one subfolder, so the grid has a folder cell before them.
+    fn files() -> Vec<String> {
+        let mut files: Vec<String> = (0..30).map(|i| format!("m{i:02}.stl")).collect();
+        files.push("extra/e0.stl".into());
+        files
+    }
+
+    fn app(session: Session) -> App {
+        App {
+            session,
+            registry: default_registry(),
+            thumbs: ThumbTextures::default(),
+            grid: GridState::default(),
+            film: GridState::default(),
+        }
+    }
+
+    fn grid_harness(session: Session) -> Harness<'static, App> {
+        Harness::builder()
+            .with_size(vec2(1000.0, 420.0))
+            .build_ui_state(
+                |ui, app: &mut App| {
+                    crate::theme::apply(ui.ctx());
+                    allow_slow_double_clicks(ui.ctx());
+                    app.session.poll();
+                    let mut actions = Actions::default();
+                    grid(
+                        ui,
+                        &mut app.session,
+                        &mut app.thumbs,
+                        &mut app.grid,
+                        &mut actions,
+                    );
+                    app.run(actions);
+                },
+                app(session),
+            )
+    }
+
+    fn filmstrip_harness(session: Session) -> Harness<'static, App> {
+        Harness::builder()
+            .with_size(vec2(700.0, 96.0))
+            .build_ui_state(
+                |ui, app: &mut App| {
+                    crate::theme::apply(ui.ctx());
+                    app.session.poll();
+                    let mut actions = Actions::default();
+                    filmstrip(
+                        ui,
+                        &mut app.session,
+                        &mut app.thumbs,
+                        &mut app.film,
+                        &mut actions,
+                    );
+                    app.run(actions);
+                },
+                app(session),
+            )
+    }
+
+    /// The harness advances time in big steps per frame, so two quick clicks would otherwise
+    /// not count as a double click.
+    fn allow_slow_double_clicks(ctx: &egui::Context) {
+        ctx.options_mut(|o| o.input_options.max_double_click_delay = 60.0);
+    }
+
+    /// Runs frames until scroll animations and the like have finished.
+    fn settle(harness: &mut Harness<'_, App>) {
+        harness.run_steps(20);
+    }
+
+    /// The on-screen area the cells can be clicked in.
+    fn screen(harness: &Harness<'_, App>) -> egui::Rect {
+        harness.ctx.content_rect()
+    }
+
+    /// Clicks the visible part of the cell labelled `label` `times` times in quick succession.
+    /// (Cells at the edge are only partly on screen, so their centre may be out of reach.)
+    fn click_cell(harness: &mut Harness<'_, App>, label: &str, times: usize, modifiers: Modifiers) {
+        let rect = harness.get_by_label(label).rect();
+        let pos = rect.intersect(screen(harness)).center();
+        harness.event(egui::Event::PointerMoved(pos));
+        harness.event(egui::Event::ModifiersChanged(modifiers));
+        for _ in 0..times {
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers,
+                });
+            }
+            // One click per frame, as with a real mouse, so egui sees a double click.
+            harness.step();
+        }
+        harness.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+        settle(harness);
+    }
+
+    /// Labels of the cells currently on screen.
+    fn visible_cells(harness: &Harness<'_, App>) -> Vec<String> {
+        harness
+            .query_all_by_role(Role::Button)
+            .filter_map(|n| n.accesskit_node().label())
+            .collect()
+    }
+
+    /// Clicks every cell, scrolling until all were reached; each click must select the model
+    /// whose name is on that cell.
+    fn click_every_cell(harness: &mut Harness<'_, App>, expected_models: usize) {
+        let mut checked = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            settle(harness);
+            for label in visible_cells(harness) {
+                if label.ends_with(" folder") || !checked.insert(label.clone()) {
+                    continue;
+                }
+                click_cell(harness, &label, 1, Modifiers::NONE);
+                assert_eq!(
+                    harness.state().current_name().as_deref(),
+                    Some(label.as_str()),
+                    "clicked {label}"
+                );
+            }
+            if checked.len() == expected_models {
+                return;
+            }
+            // Bring the next rows into view.
+            let Some(last) = visible_cells(harness).pop() else {
+                break;
+            };
+            harness.get_by_label(&last).scroll_down();
+            settle(harness);
+        }
+        panic!("only reached {} of {expected_models} models", checked.len());
+    }
+
+    #[test]
+    fn clicking_a_grid_cell_selects_that_model_wherever_the_grid_is_scrolled() {
+        let (_dir, session) = imported(&files());
+        let mut harness = grid_harness(session);
+        assert!(!visible_cells(&harness).is_empty() || harness.run() > 0);
+        click_every_cell(&mut harness, 30);
+    }
+
+    #[test]
+    fn clicking_a_filmstrip_cell_selects_that_model() {
+        let (_dir, mut session) = imported(&files());
+        let root = session.catalog().folders()[0].clone();
+        default_registry()
+            .run(
+                "library.show_folder",
+                &mut session,
+                &serde_json::json!({ "path": root }),
+            )
+            .unwrap();
+        session.poll();
+        let mut harness = filmstrip_harness(session);
+        click_every_cell(&mut harness, 30);
+    }
+
+    #[test]
+    fn double_clicking_opens_that_model_in_the_loupe() {
+        // One cell in the first row, and the last one, which sits in a partly visible row.
+        for last in [false, true] {
+            let (_dir, session) = imported(&files());
+            let mut harness = grid_harness(session);
+            harness.run();
+            let mut models = visible_cells(&harness)
+                .into_iter()
+                .filter(|l| !l.ends_with(" folder"));
+            let target = if last {
+                models.next_back()
+            } else {
+                models.nth(1)
+            }
+            .unwrap();
+            click_cell(&mut harness, &target, 2, Modifiers::NONE);
+            let app = harness.state();
+            assert_eq!(app.session.view, ViewMode::Loupe, "double-clicked {target}");
+            assert_eq!(app.current_name().as_deref(), Some(target.as_str()));
+            assert_eq!(
+                app.session.loupe().id,
+                app.session.current(),
+                "the loupe loads the clicked model"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_between_two_cells() {
+        let (_dir, session) = imported(&files());
+        let mut harness = grid_harness(session);
+        harness.run();
+        click_cell(&mut harness, "m01.stl", 1, Modifiers::NONE);
+        click_cell(&mut harness, "m04.stl", 1, Modifiers::SHIFT);
+        let app = harness.state();
+        let mut names: Vec<String> = app
+            .session
+            .visible()
+            .iter()
+            .filter(|id| app.session.is_selected(**id))
+            .filter_map(|id| Some(app.session.model(*id)?.name()))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["m01.stl", "m02.stl", "m03.stl", "m04.stl"]);
+    }
 }

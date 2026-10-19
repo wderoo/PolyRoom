@@ -18,7 +18,7 @@ pub struct LoupeView {
     mesh: Option<(ModelId, GpuMesh)>,
     camera: Option<Camera>,
     /// The camera/size/mesh the texture was last rendered with.
-    rendered: Option<(Camera, u32, u32, ModelId)>,
+    rendered: Option<(Camera, u32, u32, ModelId, bool)>,
     upload_error: Option<String>,
 }
 
@@ -124,12 +124,12 @@ impl LoupeView {
         if let (Some(target), Some(camera), Some((id, gpu))) =
             (&self.target, self.camera, &self.mesh)
         {
-            let state = Some((camera, w, h, *id));
+            let state = Some((camera, w, h, *id, session.show_bed_grid));
             if self.rendered != state {
                 let style = Style {
                     background: BACKGROUND,
                     base_color: [0.62, 0.60, 0.57],
-                    show_grid: true,
+                    show_grid: session.show_bed_grid,
                 };
                 renderer.render(
                     device,

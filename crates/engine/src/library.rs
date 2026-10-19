@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use polyroom_catalog::{ColorLabel, Flag, ModelId, Op};
+use polyroom_formats::Format;
 use serde_json::Value;
 
 use crate::command::{Command, CommandRegistry, Key, Shortcut, always};
@@ -16,6 +17,13 @@ fn arg_str<'a>(command: &str, args: &'a Value, key: &str) -> Result<&'a str, Eng
             command: command.into(),
             reason: format!("expected {{\"{key}\": string}}"),
         })
+}
+
+fn unknown(command: &str, key: &str, value: &str) -> EngineError {
+    EngineError::InvalidArgument {
+        command: command.into(),
+        reason: format!("unknown {key} \"{value}\""),
+    }
 }
 
 /// The folder being browsed, if any.
@@ -269,6 +277,87 @@ pub fn register(r: &mut CommandRegistry) {
         enabled: always,
         run: |s, args| {
             s.filter = arg_str("library.filter", args, "text")?.to_owned();
+            Ok(())
+        },
+    });
+
+    // Metadata filter. Each command toggles one choice; `filter.clear` resets them all.
+    r.register(Command {
+        id: "filter.rating",
+        label: "Filter by Rating",
+        menu: "",
+        shortcut: None,
+        enabled: always,
+        run: |s, args| {
+            let stars = args
+                .get("min")
+                .and_then(Value::as_u64)
+                .filter(|n| *n <= 5)
+                .ok_or_else(|| EngineError::InvalidArgument {
+                    command: "filter.rating".into(),
+                    reason: "expected {\"min\": 0-5}".into(),
+                })?;
+            s.attributes.toggle_min_rating(stars as u8);
+            Ok(())
+        },
+    });
+    r.register(Command {
+        id: "filter.flag",
+        label: "Filter by Flag",
+        menu: "",
+        shortcut: None,
+        enabled: always,
+        run: |s, args| {
+            let flag = match arg_str("filter.flag", args, "flag")? {
+                "pick" => Flag::Pick,
+                "reject" => Flag::Reject,
+                "none" => Flag::None,
+                other => return Err(unknown("filter.flag", "flag", other)),
+            };
+            s.attributes.toggle_flag(flag);
+            Ok(())
+        },
+    });
+    r.register(Command {
+        id: "filter.label",
+        label: "Filter by Color Label",
+        menu: "",
+        shortcut: None,
+        enabled: always,
+        run: |s, args| {
+            let name = arg_str("filter.label", args, "label")?;
+            let label = ColorLabel::ALL
+                .into_iter()
+                .find(|l| l.name().eq_ignore_ascii_case(name))
+                .ok_or_else(|| unknown("filter.label", "label", name))?;
+            s.attributes.toggle_label(label);
+            Ok(())
+        },
+    });
+    r.register(Command {
+        id: "filter.format",
+        label: "Filter by File Format",
+        menu: "",
+        shortcut: None,
+        enabled: always,
+        run: |s, args| {
+            let name = arg_str("filter.format", args, "format")?;
+            let format = Format::ALL
+                .into_iter()
+                .find(|f| f.label().eq_ignore_ascii_case(name))
+                .ok_or_else(|| unknown("filter.format", "format", name))?;
+            s.attributes.toggle_format(format);
+            Ok(())
+        },
+    });
+    r.register(Command {
+        id: "filter.clear",
+        label: "Clear Attribute Filters",
+        menu: "Library/Clear Attribute Filters",
+        shortcut: None,
+        enabled: |s| s.attributes.is_active(),
+        run: |s, _| {
+            s.attributes.clear();
             Ok(())
         },
     });
@@ -718,6 +807,93 @@ mod tests {
         wait_for_scans(&mut s);
         assert_eq!(s.collection(), &Collection::Folder(root.to_owned()));
         assert_eq!(s.catalog().models().len(), 1);
+    }
+
+    #[test]
+    fn attribute_filters_narrow_the_grid_and_follow_edits() {
+        let r = default_registry();
+        let mut s = session_with(&["a.stl", "b.stl", "c.stl", "d.stl"]);
+        let run = |s: &mut Session, id: &str, args: serde_json::Value| {
+            r.run(id, s, &args).unwrap();
+            s.poll();
+        };
+        // a: 5 stars, b: 3 stars + pick, c: 3 stars + red, d: untouched.
+        for (id, rating) in [(0, 5), (1, 3), (2, 3)] {
+            run(&mut s, "select.model", json!({"id": id}));
+            run(&mut s, &format!("model.rate.{rating}"), json!(null));
+        }
+        run(&mut s, "select.model", json!({"id": 1}));
+        run(&mut s, "model.flag.pick", json!(null));
+        run(&mut s, "select.model", json!({"id": 2}));
+        run(&mut s, "model.label.red", json!(null));
+        let shown = |s: &Session| s.visible().to_vec();
+        assert_eq!(shown(&s), [0, 1, 2, 3]);
+
+        run(&mut s, "filter.rating", json!({"min": 3}));
+        assert_eq!(shown(&s), [0, 1, 2], "3 stars or more");
+        run(&mut s, "filter.flag", json!({"flag": "pick"}));
+        assert_eq!(shown(&s), [1]);
+        run(&mut s, "filter.flag", json!({"flag": "pick"})); // toggles off again
+        run(&mut s, "filter.label", json!({"label": "Red"}));
+        assert_eq!(shown(&s), [2]);
+        run(&mut s, "filter.format", json!({"format": "obj"}));
+        assert!(shown(&s).is_empty());
+        run(&mut s, "filter.format", json!({"format": "stl"}));
+        run(&mut s, "filter.format", json!({"format": "obj"}));
+        assert_eq!(shown(&s), [2]);
+
+        // Editing a model while filtered updates the grid right away.
+        run(&mut s, "select.model", json!({"id": 2}));
+        run(&mut s, "model.rate.1", json!(null));
+        assert!(shown(&s).is_empty(), "no longer 3 stars");
+        // (The edited model left the selection with it, so edit through the engine directly.)
+        s.apply(polyroom_catalog::Op::SetRating { id: 2, rating: 4 });
+        s.poll();
+        assert_eq!(shown(&s), [2]);
+
+        assert!(r.is_enabled("filter.clear", &s));
+        run(&mut s, "filter.clear", json!(null));
+        assert!(!r.is_enabled("filter.clear", &s));
+        assert_eq!(shown(&s), [0, 1, 2, 3]);
+
+        for (id, args) in [
+            ("filter.rating", json!({"min": 6})),
+            ("filter.flag", json!({"flag": "maybe"})),
+            ("filter.label", json!({})),
+            ("filter.format", json!({"format": "step"})),
+        ] {
+            assert!(r.run(id, &mut s, &args).is_err(), "{id} {args}");
+        }
+    }
+
+    #[test]
+    fn an_attribute_filter_searches_subfolders() {
+        let r = default_registry();
+        let mut s = session_with(&["top.stl", "sub/deep.stl"]);
+        r.run("library.show_folder", &mut s, &json!({"path": "C:/m"}))
+            .unwrap();
+        s.poll();
+        assert_eq!(s.visible().len(), 1);
+        assert_eq!(s.visible_folders().len(), 1);
+        r.run("filter.format", &mut s, &json!({"format": "stl"}))
+            .unwrap();
+        s.poll();
+        assert_eq!(s.visible().len(), 2);
+        assert!(s.visible_folders().is_empty());
+    }
+
+    #[test]
+    fn importing_clears_the_attribute_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.stl"), b"x").unwrap();
+        let r = default_registry();
+        let mut s = Session::new();
+        r.run("filter.rating", &mut s, &json!({"min": 4})).unwrap();
+        r.run("library.import", &mut s, &json!({"path": dir.path()}))
+            .unwrap();
+        wait_for_scans(&mut s);
+        assert!(!s.attributes().is_active());
+        assert_eq!(s.visible().len(), 1, "new, unrated models must be shown");
     }
 
     #[test]

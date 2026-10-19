@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod attributes;
 mod command;
 mod commands;
 mod error;
@@ -12,7 +13,9 @@ mod folders;
 mod library;
 mod progress;
 mod session;
+mod settings;
 
+pub use attributes::AttributeFilter;
 pub use command::{Command, CommandRegistry, Key, Shortcut};
 pub use error::EngineError;
 pub use folders::FolderNode;

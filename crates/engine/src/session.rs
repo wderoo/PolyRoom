@@ -2,24 +2,35 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 use polyroom_catalog::{Catalog, CatalogError, Model, ModelId, Op, ScannedFile, SyncReport};
 use polyroom_mesh::Mesh;
 use polyroom_preview::{Event, PreviewService};
 use polyroom_render::Image;
+use serde::{Deserialize, Serialize};
 
+use crate::attributes::AttributeFilter;
 use crate::folders::{self, FolderNode};
 use crate::progress::{Progress, Tracker};
+use crate::settings::{self, Settings};
 
-/// Preview jobs an import keeps queued at once; the rest wait in the engine so that cells the
-/// user scrolls to are served first.
 /// Finished thumbnails handed to the UI per frame.
 const THUMBNAILS_PER_FRAME: usize = 8;
 
+/// Preview jobs an import keeps queued at once; the rest wait in the engine so that cells the
+/// user scrolls to are served first.
 const IMPORT_IN_FLIGHT: usize = 16;
 
+/// What the visible list was computed from: the catalog layout, edit counter (only tracked
+/// while an attribute filter is active), collection, name filter and attribute filter.
+type VisibleKey = (u64, u64, Collection, String, AttributeFilter);
+
+/// How long a changed setting waits before it is written, so dragging a slider saves once.
+const SETTINGS_DEBOUNCE: Duration = Duration::from_millis(400);
+
 /// The top-level module, like Lightroom's Library/Develop switcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Module {
     #[default]
     Library,
@@ -27,7 +38,7 @@ pub enum Module {
 }
 
 /// How the centre of the Library module shows models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViewMode {
     #[default]
     Grid,
@@ -35,7 +46,8 @@ pub enum ViewMode {
 }
 
 /// Visibility of the panels around the centre view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Panels {
     pub left: bool,
     pub right: bool,
@@ -66,7 +78,7 @@ pub enum Request {
 }
 
 /// Which models the grid shows, like Lightroom's Catalog/Folders panel.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Collection {
     #[default]
     All,
@@ -131,6 +143,8 @@ pub struct Session {
     pub panels: Panels,
     /// Grid thumbnail edge length in logical pixels.
     pub thumb_size: f32,
+    /// Whether the 3D view draws the build-plate grid.
+    pub show_bed_grid: bool,
     /// Columns in the grid as last laid out by the UI; used for Up/Down navigation.
     pub grid_columns: usize,
 
@@ -138,10 +152,11 @@ pub struct Session {
     preview: Option<PreviewService>,
     pub(crate) collection: Collection,
     pub(crate) filter: String,
+    pub(crate) attributes: AttributeFilter,
     visible: Vec<ModelId>,
     /// Subfolders shown as cells before the models when browsing a folder.
     visible_folders: Vec<PathBuf>,
-    visible_for: Option<(u64, Collection, String)>,
+    visible_for: Option<VisibleKey>,
     folder_tree: Vec<FolderNode>,
     pub(crate) current: Option<ModelId>,
     pub(crate) selection: HashSet<ModelId>,
@@ -155,6 +170,10 @@ pub struct Session {
     stale_thumbnails: Vec<ModelId>,
     status: String,
     requests: Vec<Request>,
+    settings_path: Option<PathBuf>,
+    saved_settings: Settings,
+    /// When the settings first differed from what is on disk; `None` if they match.
+    settings_changed_at: Option<Instant>,
 }
 
 impl Session {
@@ -164,7 +183,8 @@ impl Session {
     /// A session with an in-memory catalog and no background workers (tests, headless use).
     pub fn new() -> Self {
         Self {
-            thumb_size: 192.0,
+            thumb_size: settings::DEFAULT_THUMB_SIZE,
+            show_bed_grid: true,
             grid_columns: 1,
             ..Self::default()
         }
@@ -181,10 +201,86 @@ impl Session {
             s.collection = Collection::Folder(root.clone());
         }
         s.refresh_visible();
+        let path = paths.catalog_dir.join(settings::FILE);
+        s.apply_settings(settings::load(&path));
+        s.settings_path = Some(path);
+        s.saved_settings = s.settings();
+        s.refresh_visible();
         s.current = s.visible.first().copied();
         s.selection = s.current.into_iter().collect();
         s.anchor = s.current;
         Ok(s)
+    }
+
+    /// The layout choices that are saved between runs.
+    pub(crate) fn settings(&self) -> Settings {
+        Settings {
+            thumb_size: if self.thumb_size.is_finite() {
+                self.thumb_size
+            } else {
+                settings::DEFAULT_THUMB_SIZE
+            },
+            show_bed_grid: self.show_bed_grid,
+            panels: self.panels,
+            view: self.view,
+            module: self.module,
+            collection: self.collection.clone(),
+        }
+    }
+
+    /// Restores saved choices. A folder that is no longer in the library is ignored.
+    pub(crate) fn apply_settings(&mut self, settings: Settings) {
+        self.thumb_size = if settings.thumb_size.is_finite() {
+            settings.thumb_size.clamp(Self::THUMB_MIN, Self::THUMB_MAX)
+        } else {
+            settings::DEFAULT_THUMB_SIZE
+        };
+        self.panels = settings.panels;
+        self.show_bed_grid = settings.show_bed_grid;
+        self.view = settings.view;
+        self.module = settings.module;
+        let available = match &settings.collection {
+            Collection::Folder(path) => self.folder(path).is_some(),
+            Collection::All | Collection::PreviousImport => true,
+        };
+        if available {
+            self.collection = settings.collection;
+        }
+    }
+
+    /// Writes the settings now if they changed (the front-end calls this on exit).
+    pub fn save_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        let now = self.settings();
+        self.settings_changed_at = None;
+        if now == self.saved_settings {
+            return;
+        }
+        if let Err(e) = settings::save(&path, &now) {
+            log::error!("could not save settings: {e}");
+            self.status = format!("Settings not saved: {e}");
+        }
+        // Don't retry a failing write every few hundred milliseconds.
+        self.saved_settings = now;
+    }
+
+    /// Saves changed settings once they have been stable for a moment.
+    fn sync_settings(&mut self) {
+        if self.settings_path.is_none() {
+            return;
+        }
+        if self.settings() == self.saved_settings {
+            self.settings_changed_at = None;
+        } else if self
+            .settings_changed_at
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            >= SETTINGS_DEBOUNCE
+        {
+            self.save_settings();
+        }
     }
 
     pub fn request(&mut self, request: Request) {
@@ -244,6 +340,10 @@ impl Session {
         &self.filter
     }
 
+    pub fn attributes(&self) -> &AttributeFilter {
+        &self.attributes
+    }
+
     pub fn current(&self) -> Option<ModelId> {
         self.current
     }
@@ -272,6 +372,7 @@ impl Session {
     pub fn is_busy(&self) -> bool {
         !self.scans.is_empty()
             || !self.fresh_thumbnails.is_empty()
+            || self.settings_changed_at.is_some()
             || self.import_progress.is_active()
             || self.preview.as_ref().is_some_and(PreviewService::is_busy)
     }
@@ -522,6 +623,7 @@ impl Session {
 
         self.apply_all(ops);
         self.feed_import_previews();
+        self.sync_settings();
         self.refresh_visible();
         self.update_loupe();
     }
@@ -551,6 +653,7 @@ impl Session {
                     }
                     self.collection = Collection::Folder(folder.to_owned());
                     self.filter.clear();
+                    self.attributes.clear();
                     self.refresh_visible();
                     self.current = self.visible.first().copied();
                     self.selection = self.current.into_iter().collect();
@@ -575,6 +678,9 @@ impl Session {
         };
         let source = source(model);
         self.loupe.id = Some(id);
+        // The old mesh belongs to the previous model; the 3D view files whatever mesh it finds
+        // here under `loupe.id`.
+        self.loupe.mesh = None;
         self.loupe.error = None;
         match &mut self.preview {
             Some(preview) => {
@@ -587,10 +693,19 @@ impl Session {
 
     /// Recomputes the visible list if the catalog, collection or filter changed.
     pub(crate) fn refresh_visible(&mut self) {
-        let key = (
+        // Ratings, flags and labels don't change the layout, but they do change what an
+        // attribute filter shows.
+        let edits = if self.attributes.is_active() {
+            self.catalog.version()
+        } else {
+            0
+        };
+        let key: VisibleKey = (
             self.catalog.layout_version(),
+            edits,
             self.collection.clone(),
             self.filter.clone(),
+            self.attributes.clone(),
         );
         if self.visible_for.as_ref() == Some(&key) {
             return;
@@ -605,7 +720,7 @@ impl Session {
         }
         let last_import = self.catalog.last_import();
         // In a folder: only its own models, unless searching, which looks in subfolders too.
-        let searching = !words.is_empty();
+        let searching = !words.is_empty() || self.attributes.is_active();
         self.visible = self
             .catalog
             .models()
@@ -616,6 +731,7 @@ impl Session {
                 Collection::Folder(f) if searching => m.path.starts_with(f),
                 Collection::Folder(f) => m.path.parent() == Some(f.as_path()),
             })
+            .filter(|m| self.attributes.matches(m))
             .filter(|m| {
                 let name = m.name().to_lowercase();
                 words.iter().all(|w| name.contains(w.as_str()))
@@ -658,5 +774,150 @@ fn source(model: &Model) -> polyroom_preview::Source {
         path: model.path.clone(),
         size: model.size,
         modified: model.modified,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use polyroom_formats::Format;
+
+    use super::*;
+    use crate::default_registry;
+
+    /// A session whose catalog holds files in two folders and which saves settings to `path`.
+    fn session_saving_to(path: &Path) -> Session {
+        let mut s = Session::new();
+        for root in ["C:/a", "C:/b"] {
+            let file = ScannedFile {
+                path: Path::new(root).join("m.stl"),
+                format: Format::Stl,
+                size: 1,
+                modified: None,
+            };
+            s.catalog.import(Path::new(root), vec![file]).unwrap();
+        }
+        s.refresh_visible();
+        s.settings_path = Some(path.to_owned());
+        s.saved_settings = s.settings();
+        s
+    }
+
+    /// What `Session::open` does with the settings file, minus the catalog and GPU workers.
+    fn reopened(path: &Path) -> Session {
+        let mut s = session_saving_to(path);
+        s.apply_settings(settings::load(path));
+        s
+    }
+
+    #[test]
+    fn layout_choices_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(settings::FILE);
+        let r = default_registry();
+        let mut s = session_saving_to(&path);
+        r.run("view.thumb_size", &mut s, &json_size(300)).unwrap();
+        r.run("view.toggle_left_panel", &mut s, &serde_json::Value::Null)
+            .unwrap();
+        r.run(
+            "library.show_folder",
+            &mut s,
+            &serde_json::json!({"path": "C:/b"}),
+        )
+        .unwrap();
+        s.view = ViewMode::Loupe;
+
+        // Nothing is written until the change has settled...
+        s.poll();
+        assert!(!path.exists());
+        assert!(s.is_busy(), "the UI must keep repainting to flush it");
+        // ...then it is, without another change.
+        std::thread::sleep(SETTINGS_DEBOUNCE + Duration::from_millis(50));
+        s.poll();
+        assert!(path.exists());
+        assert!(!s.is_busy());
+
+        let s2 = reopened(&path);
+        assert_eq!(s2.thumb_size, 300.0);
+        assert!(!s2.panels.left && s2.panels.right && s2.panels.filmstrip);
+        assert_eq!(s2.view, ViewMode::Loupe);
+        assert_eq!(s2.collection, Collection::Folder("C:/b".into()));
+    }
+
+    /// Regression: opening a model in the loupe after another one showed the *previous* mesh,
+    /// because the loupe kept the old mesh while it switched to the new id, and the 3D view
+    /// then filed that old mesh under the new id.
+    #[test]
+    fn switching_models_never_pairs_the_new_id_with_the_old_mesh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_saving_to(&dir.path().join(settings::FILE));
+        let (a, b) = (s.catalog().models()[0].id, s.catalog().models()[1].id);
+        let cube = Arc::new(polyroom_mesh::test_cube());
+
+        // Model `a` is open in the loupe with its mesh loaded.
+        s.view = ViewMode::Loupe;
+        s.current = Some(a);
+        s.update_loupe();
+        s.loupe.mesh = Some(Arc::clone(&cube));
+        s.loupe.loading = false;
+        assert_eq!(s.loupe().id, Some(a));
+
+        // Back to the grid, then double-click `b`.
+        s.view = ViewMode::Grid;
+        s.current = Some(b);
+        s.view = ViewMode::Loupe;
+        s.update_loupe();
+
+        assert_eq!(s.loupe().id, Some(b));
+        assert!(
+            s.loupe().mesh.is_none(),
+            "the loupe must not hold model {a}'s mesh while showing model {b}"
+        );
+    }
+
+    #[test]
+    fn the_bed_grid_toggle_is_a_command_and_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(settings::FILE);
+        let r = default_registry();
+        let mut s = session_saving_to(&path);
+        assert!(s.show_bed_grid, "on by default");
+        r.run("view.toggle_bed_grid", &mut s, &serde_json::Value::Null)
+            .unwrap();
+        assert!(!s.show_bed_grid);
+        s.save_settings();
+        assert!(!reopened(&path).show_bed_grid);
+        r.run("view.toggle_bed_grid", &mut s, &serde_json::Value::Null)
+            .unwrap();
+        assert!(s.show_bed_grid);
+    }
+
+    #[test]
+    fn save_settings_flushes_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(settings::FILE);
+        let mut s = session_saving_to(&path);
+        s.panels.right = false;
+        s.save_settings();
+        assert!(!reopened(&path).panels.right);
+    }
+
+    #[test]
+    fn unusable_saved_values_are_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(settings::FILE);
+        let saved = Settings {
+            thumb_size: 10_000.0,
+            collection: Collection::Folder("C:/gone".into()),
+            ..Settings::default()
+        };
+        settings::save(&path, &saved).unwrap();
+        let s = reopened(&path);
+        assert_eq!(s.thumb_size, Session::THUMB_MAX);
+        // The saved folder is no longer imported, so the collection stays as it was.
+        assert_eq!(s.collection, Collection::All);
+    }
+
+    fn json_size(size: u32) -> serde_json::Value {
+        serde_json::json!({ "size": size })
     }
 }

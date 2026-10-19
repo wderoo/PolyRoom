@@ -24,6 +24,8 @@ pub enum Format {
 }
 
 impl Format {
+    pub const ALL: [Self; 3] = [Self::Stl, Self::ThreeMf, Self::Obj];
+
     /// Detects the format from a file extension (case-insensitive).
     pub fn from_path(path: &Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();

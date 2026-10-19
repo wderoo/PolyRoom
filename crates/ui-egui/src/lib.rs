@@ -193,6 +193,10 @@ fn show_in_file_manager(path: &std::path::Path, session: &mut Session) {
 }
 
 impl eframe::App for PolyRoomApp {
+    fn on_exit(&mut self) {
+        self.session.save_settings();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.session.poll();
@@ -341,5 +345,35 @@ mod tests {
             image.save(&out).unwrap();
             eprintln!("rendered {}", out.display());
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::time::{Duration, Instant};
+
+    use polyroom_engine::{Session, default_registry};
+    use serde_json::json;
+
+    /// A session that has imported `files` (paths relative to a temp folder, which is returned
+    /// too so that it outlives the test). No preview workers run, so no GPU is needed.
+    pub fn imported(files: &[String]) -> (tempfile::TempDir, Session) {
+        let dir = tempfile::tempdir().unwrap();
+        for file in files {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        let mut session = Session::new();
+        default_registry()
+            .run("library.import", &mut session, &json!({"path": dir.path()}))
+            .unwrap();
+        let start = Instant::now();
+        while session.is_busy() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+            session.poll();
+        }
+        session.poll();
+        (dir, session)
     }
 }
