@@ -1,3 +1,5 @@
+Disclaimer: personal Ai vibed coded application
+
 # PolyRoom
 
 A Lightroom-style library and viewer for 3D-print models (STL, 3MF, OBJ), written in pure Rust
@@ -56,14 +58,18 @@ generated models (plus some deliberately broken files) to try the app with. See
 
 ## Layout
 
-| Crate              | Purpose                                                        |
-|--------------------|----------------------------------------------------------------|
-| `crates/mesh`      | Indexed meshes, bounds, volume/area stats                      |
-| `crates/formats`   | STL (binary/ASCII), OBJ and 3MF loaders                        |
-| `crates/render`    | wgpu renderer for the loupe and headless thumbnails            |
-| `crates/catalog`   | The library: models, ratings, flags, labels; op-log persistence |
-| `crates/preview`   | Background loading, stats and thumbnail cache                  |
-| `crates/engine`    | Session state and the command registry                         |
-| `crates/ui-egui`   | The egui front-end                                             |
-| `apps/polyroom`    | Desktop binary                                                 |
-| `xtask`            | Build automation                                               |
+| Crate            | Purpose                                                         |
+| ---------------- | --------------------------------------------------------------- |
+| `crates/mesh`    | Indexed meshes, bounds, volume/area stats                       |
+| `crates/formats` | STL (binary/ASCII), OBJ and 3MF loaders                         |
+| `crates/render`  | wgpu renderer for the loupe and headless thumbnails             |
+| `crates/catalog` | The library: models, ratings, flags, labels; op-log persistence |
+| `crates/preview` | Background loading, stats and thumbnail cache                   |
+| `crates/engine`  | Session state and the command registry                          |
+| `crates/ui-egui` | The egui front-end                                              |
+| `apps/polyroom`  | Desktop binary                                                  |
+| `xtask`          | Build automation                                                |
+
+## License
+
+[MIT](LICENSE)
