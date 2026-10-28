@@ -6,10 +6,15 @@ A Lightroom-style library and viewer for 3D-print models (STL, 3MF, OBJ), writte
 with [egui](https://github.com/emilk/egui) and [wgpu](https://wgpu.rs).
 
 - Import folders; models are referenced in place, never copied.
-- Thumbnail grid and filmstrip with rendered previews (cached on disk).
-- 3D loupe: orbit, pan, zoom, with a build-plate grid.
-- Lightroom keys: `0`–`5` rate, `P`/`X`/`U` flag, `6`–`9` colour labels, arrows to navigate,
-  `G` grid, `E` loupe, `Tab` hide panels, `Ctrl+/` for all shortcuts.
+- Thumbnail grid of the open folder with rendered previews (cached on disk), a breadcrumb,
+  sorting, filters and an action bar; right-click a file or folder to reveal or delete it.
+- Preview pane: a live 3D view (orbit, pan, zoom, build-plate grid), photos and ZIP contents,
+  plus category, tags and favorite.
+- Organise with categories, tags and favorites; filter by them from the left panel.
+- Remove folders from the library, or move files to the Recycle Bin (after a confirmation).
+- Settings for preview images: quality, background and model colour, and regenerate.
+- Lightroom keys: `0`–`5` rate, `P`/`X`/`U` flag, `6`–`9` colour labels, `H` favorite, arrows to
+  navigate, `Delete` delete, `Tab` hide panels, `Ctrl+,` settings, `Ctrl+/` for all shortcuts.
 - Metadata: dimensions in mm, triangle count, volume and surface area.
 
 ## Prerequisites (Windows)
@@ -62,7 +67,7 @@ generated models (plus some deliberately broken files) to try the app with. See
 | ---------------- | --------------------------------------------------------------- |
 | `crates/mesh`    | Indexed meshes, bounds, volume/area stats                       |
 | `crates/formats` | STL (binary/ASCII), OBJ and 3MF loaders                         |
-| `crates/render`  | wgpu renderer for the loupe and headless thumbnails             |
+| `crates/render`  | wgpu renderer for the 3D view and headless thumbnails             |
 | `crates/catalog` | The library: models, ratings, flags, labels; op-log persistence |
 | `crates/preview` | Background loading, stats and thumbnail cache                   |
 | `crates/engine`  | Session state and the command registry                          |

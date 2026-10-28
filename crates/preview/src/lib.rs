@@ -19,11 +19,11 @@ use std::thread;
 use polyroom_formats::Format;
 use polyroom_formats::archive::{self, ArchiveEntry};
 use polyroom_mesh::{Mesh, MeshStats};
-use polyroom_render::{Headless, Image};
+use polyroom_render::{Headless, Image, Style};
 
 pub use cache::{decode_png, encode_png};
 
-/// Thumbnail edge length in pixels.
+/// Default thumbnail edge length in pixels.
 pub const THUMB_PX: u32 = 256;
 /// Largest image inside a ZIP we decode for its cover.
 const MAX_ZIP_IMAGE: u64 = 64 << 20;
@@ -44,35 +44,80 @@ pub struct Source {
     pub modified: Option<u64>,
 }
 
+/// How thumbnails look. Each style has its own cache files, so changing it never serves stale
+/// images, and changing it back is instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThumbStyle {
+    /// Edge length in pixels.
+    pub size: u32,
+    /// sRGB background colour; `None` is transparent.
+    pub background: Option<[u8; 3]>,
+    /// sRGB model colour.
+    pub model_color: [u8; 3],
+    /// Bumped to throw away every cached thumbnail.
+    pub generation: u32,
+}
+
+impl Default for ThumbStyle {
+    fn default() -> Self {
+        Self {
+            size: THUMB_PX,
+            background: None,
+            model_color: [207, 203, 198],
+            generation: 0,
+        }
+    }
+}
+
+impl ThumbStyle {
+    fn render_style(&self) -> Style {
+        let channel = |c: u8| f32::from(c) / 255.0;
+        let linear = |c: u8| {
+            let c = channel(c);
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let [r, g, b] = self.model_color;
+        Style {
+            background: self.background.map_or([0.0; 4], |[r, g, b]| {
+                [channel(r), channel(g), channel(b), 1.0]
+            }),
+            base_color: [linear(r), linear(g), linear(b)],
+            show_grid: false,
+        }
+    }
+
+    /// Cached files of this generation start with this.
+    fn file_prefix(&self) -> String {
+        format!("g{}-", self.generation)
+    }
+}
+
 impl Source {
-    fn cache_key(&self) -> String {
+    fn cache_key(&self, style: &ThumbStyle) -> String {
         let mut h = DefaultHasher::new();
-        (self, RENDER_VERSION, THUMB_PX).hash(&mut h);
-        format!("{:016x}", h.finish())
+        (self, RENDER_VERSION, style).hash(&mut h);
+        format!("{}{:016x}", style.file_prefix(), h.finish())
     }
 }
 
 #[derive(Debug)]
 pub enum Event {
     /// Stats from a freshly parsed model.
-    Stats {
-        id: JobId,
-        stats: MeshStats,
-    },
+    Stats { id: JobId, stats: MeshStats },
     Thumbnail {
         id: JobId,
         image: Image,
+        /// The look the image was made in; images of an older style are dropped.
+        style: ThumbStyle,
     },
     /// A full mesh for the loupe.
-    Mesh {
-        id: JobId,
-        mesh: Arc<Mesh>,
-    },
+    Mesh { id: JobId, mesh: Arc<Mesh> },
     /// A preview image at loupe size.
-    Picture {
-        id: JobId,
-        image: Arc<Image>,
-    },
+    Picture { id: JobId, image: Arc<Image> },
     /// The files inside a ZIP archive.
     Archive {
         id: JobId,
@@ -94,6 +139,7 @@ enum Job {
         source: Source,
         /// Parse the model even when the thumbnail is cached, to get its stats.
         need_stats: bool,
+        style: ThumbStyle,
     },
     Mesh {
         id: JobId,
@@ -119,6 +165,8 @@ struct Queue {
 type SharedQueue = Arc<(Mutex<Queue>, Condvar)>;
 
 pub struct PreviewService {
+    cache_dir: PathBuf,
+    style: ThumbStyle,
     queue: SharedQueue,
     events: Receiver<Event>,
     pending_thumbs: HashSet<JobId>,
@@ -133,7 +181,7 @@ impl PreviewService {
         let queue: SharedQueue = Arc::default();
         let (event_tx, events) = mpsc::channel();
         // Bounded so parsers can't run far ahead of the GPU and pile up meshes in memory.
-        let (render_tx, render_rx) = mpsc::sync_channel::<(JobId, Mesh, PathBuf)>(2);
+        let (render_tx, render_rx) = mpsc::sync_channel::<RenderJob>(2);
 
         let gpu_events = event_tx.clone();
         let spawned = thread::Builder::new()
@@ -158,6 +206,8 @@ impl PreviewService {
         }
 
         Self {
+            cache_dir,
+            style: ThumbStyle::default(),
             queue,
             events,
             pending_thumbs: HashSet::new(),
@@ -177,17 +227,67 @@ impl PreviewService {
         cvar.notify_one();
     }
 
+    pub fn style(&self) -> ThumbStyle {
+        self.style
+    }
+
+    /// Changes how new thumbnails look. Queued thumbnails are dropped so that they are made
+    /// again in the new style; thumbnails already made are the caller's to refresh.
+    pub fn set_style(&mut self, style: ThumbStyle) {
+        if style == self.style {
+            return;
+        }
+        self.style = style;
+        self.clear_queued_thumbnails();
+    }
+
     /// Queues a thumbnail unless one is already pending for `id`.
     pub fn request_thumbnail(&mut self, id: JobId, source: Source, need_stats: bool) {
         if self.pending_thumbs.insert(id) {
+            let style = self.style;
             self.push(
                 Job::Thumbnail {
                     id,
                     source,
                     need_stats,
+                    style,
                 },
                 false,
             );
+        }
+    }
+
+    /// Deletes the cached thumbnail of `source`, so the next request renders it again.
+    pub fn forget_cached(&self, source: &Source) {
+        let path = self
+            .cache_dir
+            .join(format!("{}.png", source.cache_key(&self.style)));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("could not delete {}: {e}", path.display()),
+        }
+    }
+
+    /// Deletes, in the background, every cached thumbnail that is not of the current
+    /// generation (including files from before generations existed).
+    pub fn purge_old_generations(&self) {
+        let (dir, keep) = (self.cache_dir.clone(), self.style.file_prefix());
+        let spawned = thread::Builder::new()
+            .name("polyroom-cache-purge".into())
+            .spawn(move || {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.ends_with(".png") && !name.starts_with(&keep) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("could not start cache cleanup: {e}");
         }
     }
 
@@ -260,7 +360,7 @@ impl PreviewService {
 
     /// Takes all finished results.
     pub fn poll(&mut self) -> Vec<Event> {
-        let events: Vec<Event> = self.events.try_iter().collect();
+        let mut events: Vec<Event> = self.events.try_iter().collect();
         for e in &events {
             match e {
                 Event::Thumbnail { id, .. } => {
@@ -288,6 +388,8 @@ impl PreviewService {
                 Event::Stats { .. } => {}
             }
         }
+        // A thumbnail made before the style changed would sit next to new ones.
+        events.retain(|e| !matches!(e, Event::Thumbnail { style, .. } if *style != self.style));
         events
     }
 }
@@ -317,7 +419,7 @@ fn next_job(queue: &SharedQueue) -> Option<Job> {
 fn worker(
     queue: &SharedQueue,
     events: &Sender<Event>,
-    render: &SyncSender<(JobId, Mesh, PathBuf)>,
+    render: &SyncSender<RenderJob>,
     cache_dir: &Path,
 ) {
     while let Some(job) = next_job(queue) {
@@ -363,23 +465,25 @@ fn worker(
                 id,
                 source,
                 need_stats,
+                style,
             } => {
-                let cache_path = cache_dir.join(format!("{}.png", source.cache_key()));
+                let cache_path = cache_dir.join(format!("{}.png", source.cache_key(&style)));
                 let cached = std::fs::read(&cache_path).ok().and_then(|b| decode_png(&b));
                 let format = Format::from_path(&source.path);
                 if let (Some(image), false) = (&cached, need_stats) {
                     events.send(Event::Thumbnail {
                         id,
                         image: image.clone(),
+                        style,
                     })
                 } else if format == Some(Format::Image) {
                     let thumb = std::fs::read(&source.path)
                         .map_err(|e| format!("could not read file: {e}"))
-                        .and_then(|bytes| guarded(|| picture::thumbnail(&bytes, THUMB_PX)));
+                        .and_then(|bytes| guarded(|| picture::thumbnail(&bytes, style.size)));
                     match thumb {
                         Ok(image) => {
                             write_cache(&cache_path, &image);
-                            events.send(Event::Thumbnail { id, image })
+                            events.send(Event::Thumbnail { id, image, style })
                         }
                         Err(error) => events.send(Event::Failed {
                             id,
@@ -388,13 +492,13 @@ fn worker(
                         }),
                     }
                 } else if format == Some(Format::Zip) {
-                    match guarded(|| zip_cover(&source.path)) {
+                    match guarded(|| zip_cover(&source.path, style.size)) {
                         Ok(Cover::Image(image)) => {
                             write_cache(&cache_path, &image);
-                            events.send(Event::Thumbnail { id, image })
+                            events.send(Event::Thumbnail { id, image, style })
                         }
                         Ok(Cover::Mesh(mesh)) => {
-                            if render.send((id, mesh, cache_path)).is_err() {
+                            if render.send((id, mesh, cache_path, style)).is_err() {
                                 let _ = events.send(Event::Failed {
                                     id,
                                     error: "thumbnail renderer is not running".into(),
@@ -427,9 +531,9 @@ fn worker(
                                 let _ = events.send(Event::Stats { id, stats });
                             }
                             match cached {
-                                Some(image) => events.send(Event::Thumbnail { id, image }),
+                                Some(image) => events.send(Event::Thumbnail { id, image, style }),
                                 None => {
-                                    if render.send((id, mesh, cache_path)).is_err() {
+                                    if render.send((id, mesh, cache_path, style)).is_err() {
                                         // GPU thread is gone; nothing more we can do.
                                         let _ = events.send(Event::Failed {
                                             id,
@@ -500,7 +604,7 @@ fn is_online_only(path: &Path) -> bool {
 
 /// Picks a ZIP's cover: the first image inside, else the first model inside that loads.
 /// Only an unreadable archive is an error; bad files inside it are skipped.
-fn zip_cover(path: &Path) -> Result<Cover, String> {
+fn zip_cover(path: &Path, size: u32) -> Result<Cover, String> {
     if is_online_only(path) {
         return Ok(Cover::NotDownloaded);
     }
@@ -510,8 +614,7 @@ fn zip_cover(path: &Path) -> Result<Cover, String> {
         .iter()
         .filter(|e| e.format == Some(Format::Image) && e.size <= MAX_ZIP_IMAGE)
     {
-        if let Some(image) =
-            read(e, MAX_ZIP_IMAGE).and_then(|b| picture::thumbnail(&b, THUMB_PX).ok())
+        if let Some(image) = read(e, MAX_ZIP_IMAGE).and_then(|b| picture::thumbnail(&b, size).ok())
         {
             return Ok(Cover::Image(image));
         }
@@ -546,7 +649,10 @@ fn write_cache(cache_path: &Path, image: &Image) {
     }
 }
 
-fn gpu_thread(jobs: &Receiver<(JobId, Mesh, PathBuf)>, events: &Sender<Event>) {
+/// A mesh waiting for the GPU thread: its job, the cache file to write and the look to render.
+type RenderJob = (JobId, Mesh, PathBuf, ThumbStyle);
+
+fn gpu_thread(jobs: &Receiver<RenderJob>, events: &Sender<Event>) {
     let gpu = match Headless::new() {
         Ok(gpu) => Some(gpu),
         Err(e) => {
@@ -554,16 +660,19 @@ fn gpu_thread(jobs: &Receiver<(JobId, Mesh, PathBuf)>, events: &Sender<Event>) {
             None
         }
     };
-    for (id, mesh, cache_path) in jobs {
+    for (id, mesh, cache_path, style) in jobs {
         let result = match &gpu {
-            Some(gpu) => guarded(|| gpu.thumbnail(&mesh, THUMB_PX).map_err(|e| e.to_string())),
+            Some(gpu) => guarded(|| {
+                gpu.thumbnail_styled(&mesh, style.size, &style.render_style())
+                    .map_err(|e| e.to_string())
+            }),
             None => Err("no GPU available for thumbnails".to_owned()),
         };
         drop(mesh);
         let event = match result {
             Ok(image) => {
                 write_cache(&cache_path, &image);
-                Event::Thumbnail { id, image }
+                Event::Thumbnail { id, image, style }
             }
             Err(error) => Event::Failed {
                 id,
@@ -756,5 +865,131 @@ mod tests {
             matches!(events.last(), Some(Event::Archive { entries, .. }) if entries.len() == 2)
         );
         assert!(!s.is_busy());
+    }
+
+    fn some_source() -> Source {
+        Source {
+            path: PathBuf::from("C:/m/a.stl"),
+            size: 1,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn every_style_has_its_own_cache_file() {
+        let source = some_source();
+        let base = ThumbStyle::default();
+        let key = |style: ThumbStyle| source.cache_key(&style);
+        let keys = [
+            key(base),
+            key(ThumbStyle { size: 512, ..base }),
+            key(ThumbStyle {
+                background: Some([0, 0, 0]),
+                ..base
+            }),
+            key(ThumbStyle {
+                model_color: [255, 128, 0],
+                ..base
+            }),
+            key(ThumbStyle {
+                generation: 1,
+                ..base
+            }),
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in keys.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(key(base), key(ThumbStyle::default()), "keys are stable");
+    }
+
+    #[test]
+    fn the_render_style_follows_the_thumb_style() {
+        let style = ThumbStyle {
+            background: Some([255, 0, 0]),
+            model_color: [255, 255, 255],
+            ..ThumbStyle::default()
+        };
+        let render = style.render_style();
+        assert_eq!(render.background, [1.0, 0.0, 0.0, 1.0]);
+        assert!(render.base_color.iter().all(|c| (c - 1.0).abs() < 1e-3));
+        assert_eq!(ThumbStyle::default().render_style().background, [0.0; 4]);
+    }
+
+    #[test]
+    fn forgetting_a_thumbnail_deletes_only_its_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = PreviewService::start(dir.path().to_owned());
+        let (mine, other) = (
+            some_source(),
+            Source {
+                size: 2,
+                ..some_source()
+            },
+        );
+        let file = |src: &Source| {
+            dir.path()
+                .join(format!("{}.png", src.cache_key(&s.style())))
+        };
+        std::fs::write(file(&mine), b"x").unwrap();
+        std::fs::write(file(&other), b"x").unwrap();
+        s.forget_cached(&mine);
+        assert!(!file(&mine).exists() && file(&other).exists());
+        s.forget_cached(&mine); // already gone: no error
+    }
+
+    #[test]
+    fn purging_removes_other_generations_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PreviewService::start(dir.path().to_owned());
+        s.set_style(ThumbStyle {
+            generation: 3,
+            ..ThumbStyle::default()
+        });
+        for name in ["old.png", "g2-abc.png", "g3-keep.png", "notes.txt"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        s.purge_old_generations();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while dir.path().join("g2-abc.png").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let left = |n: &str| dir.path().join(n).exists();
+        assert!(!left("old.png") && !left("g2-abc.png"));
+        assert!(left("g3-keep.png") && left("notes.txt"));
+    }
+
+    #[test]
+    fn a_new_style_drops_queued_thumbnails_and_makes_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("a.png");
+        let mut png = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png, 8, 8);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[255u8; 8 * 8 * 4]).unwrap();
+        }
+        std::fs::write(&photo, &png).unwrap();
+        let mut s = PreviewService::start(dir.path().join("cache"));
+        s.set_style(ThumbStyle {
+            size: 512,
+            ..ThumbStyle::default()
+        });
+        let source = Source {
+            path: photo,
+            size: png.len() as u64,
+            modified: None,
+        };
+        s.request_thumbnail(1, source, false);
+        let events = wait_for(&mut s, |e| {
+            matches!(e, Event::Thumbnail { .. } | Event::Failed { .. })
+        });
+        assert!(
+            matches!(events.last(), Some(Event::Thumbnail { image, .. }) if image.width == 512),
+            "{events:?}"
+        );
     }
 }

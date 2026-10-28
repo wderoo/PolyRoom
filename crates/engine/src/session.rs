@@ -1,10 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use polyroom_catalog::{Catalog, CatalogError, Model, ModelId, Op, ScannedFile, SyncReport};
+use polyroom_catalog::{
+    Catalog, CatalogError, CategoryId, Model, ModelId, Op, ScannedFile, SyncReport,
+};
 use polyroom_formats::Format;
 use polyroom_formats::archive::ArchiveEntry;
 use polyroom_mesh::Mesh;
@@ -15,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::attributes::AttributeFilter;
 use crate::folders::{self, FolderNode};
 use crate::progress::{Progress, Tracker};
-use crate::settings::{self, Settings};
+use crate::settings::{self, PreviewSettings, Settings};
+use crate::sort::{Sort, SortKey};
 use crate::stacks::Stacks;
 
 /// Finished thumbnails handed to the UI per frame.
@@ -30,25 +33,30 @@ const IMPORT_IN_FLIGHT: usize = 16;
 
 /// What the visible list was computed from: the catalog layout, edit counter (only tracked
 /// while an attribute filter is active), collection, name filter and attribute filter.
-type VisibleKey = (u64, u64, Collection, String, AttributeFilter);
+type VisibleKey = (u64, u64, Collection, String, AttributeFilter, Sort);
 
 /// How long a changed setting waits before it is written, so dragging a slider saves once.
 const SETTINGS_DEBOUNCE: Duration = Duration::from_millis(400);
 
-/// The top-level module, like Lightroom's Library/Develop switcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Module {
-    #[default]
-    Library,
-    Viewer,
+/// How many models each category, tag and the favorites hold; shown in the left panel.
+#[derive(Debug, Default)]
+struct OrganizeCounts {
+    /// The catalog versions these were counted at.
+    for_versions: Option<(u64, u64)>,
+    categories: HashMap<Option<CategoryId>, usize>,
+    tags: BTreeMap<String, usize>,
+    favorites: usize,
 }
 
-/// How the centre of the Library module shows models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum ViewMode {
-    #[default]
-    Grid,
-    Loupe,
+/// Moves a path to the Recycle Bin.
+pub(crate) type TrashFn = fn(&Path) -> Result<(), String>;
+
+/// Totals shown in the status bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LibraryStats {
+    pub folders: usize,
+    pub files: usize,
+    pub bytes: u64,
 }
 
 /// Visibility of the panels around the centre view.
@@ -57,7 +65,6 @@ pub enum ViewMode {
 pub struct Panels {
     pub left: bool,
     pub right: bool,
-    pub filmstrip: bool,
 }
 
 impl Default for Panels {
@@ -65,7 +72,6 @@ impl Default for Panels {
         Self {
             left: true,
             right: true,
-            filmstrip: true,
         }
     }
 }
@@ -79,6 +85,16 @@ pub enum Request {
     ShowShortcuts,
     /// Open a folder in the system file manager.
     ShowInExplorer(PathBuf),
+    /// Show a file or folder selected in the system file manager.
+    RevealFile(PathBuf),
+    /// Open a file with its default application.
+    OpenFile(PathBuf),
+    /// Ask before moving these files or folders to the Recycle Bin (`file.delete_confirmed`).
+    ConfirmDelete(Vec<PathBuf>),
+    /// Ask before removing a folder from the library (`library.remove_folder_confirmed`).
+    ConfirmRemoveFolder(PathBuf),
+    /// Show the settings window.
+    ShowSettings,
     /// Close the application.
     Quit,
 }
@@ -152,8 +168,6 @@ pub struct Loupe {
 /// All state of one running PolyRoom instance.
 #[derive(Default)]
 pub struct Session {
-    pub module: Module,
-    pub view: ViewMode,
     pub panels: Panels,
     /// Grid thumbnail edge length in logical pixels.
     pub thumb_size: f32,
@@ -169,6 +183,14 @@ pub struct Session {
     pub(crate) collection: Collection,
     pub(crate) filter: String,
     pub(crate) attributes: AttributeFilter,
+    pub(crate) sort: Sort,
+    pub(crate) preview_settings: PreviewSettings,
+    /// A subfolder cell the user clicked; the preview pane shows it instead of a model.
+    pub(crate) focused_folder: Option<PathBuf>,
+    library_stats: LibraryStats,
+    organize: OrganizeCounts,
+    /// Moves a path to the Recycle Bin; tests replace it.
+    pub(crate) trash: Option<TrashFn>,
     visible: Vec<ModelId>,
     /// Subfolders shown as cells before the models when browsing a folder.
     visible_folders: Vec<PathBuf>,
@@ -181,7 +203,7 @@ pub struct Session {
     pub(crate) loupe: Loupe,
     fresh_thumbnails: Vec<(ModelId, Image)>,
     /// Thumbnails that failed this session; not retried until restart.
-    thumbnail_failed: HashSet<ModelId>,
+    pub(crate) thumbnail_failed: HashSet<ModelId>,
     scans: Vec<Scan>,
     import_progress: Tracker,
     stale_thumbnails: Vec<ModelId>,
@@ -241,9 +263,9 @@ impl Session {
             show_bed_grid: self.show_bed_grid,
             photo_covers: self.photo_covers,
             panels: self.panels,
-            view: self.view,
-            module: self.module,
+            sort: self.sort,
             collection: self.collection.clone(),
+            preview: self.preview_settings,
         }
     }
 
@@ -257,8 +279,9 @@ impl Session {
         self.panels = settings.panels;
         self.show_bed_grid = settings.show_bed_grid;
         self.photo_covers = settings.photo_covers;
-        self.view = settings.view;
-        self.module = settings.module;
+        self.sort = settings.sort;
+        self.preview_settings = settings.preview.sanitized();
+        self.sync_preview_style();
         let available = match &settings.collection {
             Collection::Folder(path) => self.folder(path).is_some(),
             Collection::All | Collection::PreviousImport => true,
@@ -534,7 +557,7 @@ impl Session {
     }
 
     /// Runs `ops` against the catalog with a single log write.
-    fn apply_all(&mut self, ops: Vec<Op>) {
+    pub(crate) fn apply_all(&mut self, ops: Vec<Op>) {
         if ops.is_empty() {
             return;
         }
@@ -618,7 +641,7 @@ impl Session {
             }
             match event {
                 Event::Stats { id, stats } => ops.push(Op::SetStats { id, stats }),
-                Event::Thumbnail { id, image } => self.fresh_thumbnails.push((id, image)),
+                Event::Thumbnail { id, image, .. } => self.fresh_thumbnails.push((id, image)),
                 Event::Mesh { id, mesh } => {
                     if self.loupe.id == Some(id) {
                         if let (Some(stats), true) = (
@@ -720,7 +743,7 @@ impl Session {
     /// Loads what the loupe or viewer shows of the current file: a model's mesh, an image, a
     /// ZIP's contents, or a photo from the model's stack.
     pub(crate) fn update_loupe(&mut self) {
-        let showing = self.module == Module::Viewer || self.view == ViewMode::Loupe;
+        let showing = self.panels.right;
         let Some(id) = self.current.filter(|_| showing) else {
             return;
         };
@@ -764,9 +787,10 @@ impl Session {
 
     /// Recomputes the visible list if the catalog, collection or filter changed.
     pub(crate) fn refresh_visible(&mut self) {
+        self.refresh_organize_counts();
         // Ratings, flags and labels don't change the layout, but they do change what an
         // attribute filter shows.
-        let edits = if self.attributes.is_active() {
+        let edits = if self.attributes.is_active() || self.sort.key == SortKey::Rating {
             self.catalog.version()
         } else {
             0
@@ -777,6 +801,7 @@ impl Session {
             self.collection.clone(),
             self.filter.clone(),
             self.attributes.clone(),
+            self.sort,
         );
         if self.visible_for.as_ref() == Some(&key) {
             return;
@@ -790,6 +815,11 @@ impl Session {
             self.stacks = Stacks::build(self.catalog.models());
             self.folder_tree =
                 folders::build(self.catalog.folders(), self.catalog.models(), &self.stacks);
+            self.library_stats = LibraryStats {
+                folders: folders::count(&self.folder_tree),
+                files: self.catalog.models().len(),
+                bytes: self.catalog.models().iter().map(|m| m.size).sum(),
+            };
         }
         let last_import = self.catalog.last_import();
         // In a folder: only its own models, unless searching, which looks in subfolders too.
@@ -804,13 +834,14 @@ impl Session {
                 Collection::Folder(f) if searching => m.path.starts_with(f),
                 Collection::Folder(f) => m.path.parent() == Some(f.as_path()),
             })
-            .filter(|m| self.attributes.matches(m))
+            .filter(|m| self.attributes.matches_in(m, &self.catalog))
             .filter(|m| {
                 let name = m.name().to_lowercase();
                 words.iter().all(|w| name.contains(w.as_str()))
             })
             .map(|m| m.id)
             .collect();
+        self.sort.sort_models(&mut self.visible, &self.catalog);
         // A photo stacked on a model that is shown is shown through that model.
         let shown: HashSet<ModelId> = self.visible.iter().copied().collect();
         self.visible.retain(|id| {
@@ -821,10 +852,21 @@ impl Session {
         self.visible_folders = match &self.collection {
             Collection::Folder(f) if !searching => self
                 .folder(f)
-                .map(|n| n.children.iter().map(|c| c.path.clone()).collect())
+                .map(|n| {
+                    let mut kids: Vec<&FolderNode> = n.children.iter().collect();
+                    self.sort.sort_folders(&mut kids);
+                    kids.into_iter().map(|c| c.path.clone()).collect()
+                })
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
+        if self
+            .focused_folder
+            .as_ref()
+            .is_some_and(|f| !self.visible_folders.contains(f))
+        {
+            self.focused_folder = None;
+        }
         self.visible_for = Some(key);
         // Drop selection that is no longer visible.
         let visible: HashSet<ModelId> = self.visible.iter().copied().collect();
@@ -847,6 +889,166 @@ impl Session {
                 .collect()
         }
     }
+}
+
+impl Session {
+    pub fn sort(&self) -> Sort {
+        self.sort
+    }
+
+    /// Models in a category, counting those that inherit it from their folder; `None` counts
+    /// the uncategorized ones.
+    pub fn category_count(&self, category: Option<CategoryId>) -> usize {
+        self.organize
+            .categories
+            .get(&category)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every tag in use with the number of models and folders carrying it.
+    pub fn tag_counts(&self) -> &BTreeMap<String, usize> {
+        &self.organize.tags
+    }
+
+    pub fn favorite_count(&self) -> usize {
+        self.organize.favorites
+    }
+
+    fn refresh_organize_counts(&mut self) {
+        let versions = (self.catalog.layout_version(), self.catalog.meta_version());
+        if self.organize.for_versions == Some(versions) {
+            return;
+        }
+        let mut categories: HashMap<Option<CategoryId>, usize> = HashMap::new();
+        let mut favorites = 0;
+        for m in self.catalog.models() {
+            *categories
+                .entry(self.catalog.effective_category(m))
+                .or_default() += 1;
+            favorites += usize::from(self.catalog.effective_favorite(m));
+        }
+        self.organize = OrganizeCounts {
+            for_versions: Some(versions),
+            categories,
+            tags: self.catalog.all_tags(),
+            favorites,
+        };
+    }
+
+    /// How thumbnails and the 3D preview look.
+    pub fn preview_settings(&self) -> PreviewSettings {
+        self.preview_settings
+    }
+
+    fn sync_preview_style(&mut self) {
+        if let Some(preview) = &mut self.preview {
+            preview.set_style(self.preview_settings.style());
+        }
+    }
+
+    /// Applies new preview settings: thumbnails are made again in the new look. Changing the
+    /// generation also deletes every cached thumbnail of the old ones.
+    pub(crate) fn set_preview_settings(&mut self, new: PreviewSettings) {
+        let new = new.sanitized();
+        if new == self.preview_settings {
+            return;
+        }
+        let purge = new.generation != self.preview_settings.generation;
+        self.preview_settings = new;
+        self.sync_preview_style();
+        if let (true, Some(preview)) = (purge, &self.preview) {
+            preview.purge_old_generations();
+        }
+        self.thumbnail_failed.clear();
+        self.stale_thumbnails
+            .extend(self.catalog.models().iter().map(|m| m.id));
+    }
+
+    /// Makes the thumbnails of `ids` again, ignoring what is cached.
+    pub(crate) fn regenerate_thumbnails(&mut self, ids: &[ModelId]) {
+        for &id in ids {
+            let Some(model) = self.catalog.get(id) else {
+                continue;
+            };
+            if let Some(preview) = &self.preview {
+                preview.forget_cached(&source(model));
+            }
+            self.thumbnail_failed.remove(&id);
+            self.stale_thumbnails.push(id);
+        }
+    }
+
+    /// The subfolder the preview pane shows, if one was clicked.
+    pub fn focused_folder(&self) -> Option<&Path> {
+        self.focused_folder.as_deref()
+    }
+
+    /// Folders, files and bytes in the whole library.
+    pub fn library_stats(&self) -> LibraryStats {
+        self.library_stats
+    }
+
+    /// How many files are selected and how many bytes they take.
+    pub fn selection_stats(&self) -> (usize, u64) {
+        let models = self.selection.iter().filter_map(|&id| self.catalog.get(id));
+        models.fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.size))
+    }
+
+    /// Takes a folder out of the library. Files on disk are untouched.
+    pub(crate) fn remove_folder(&mut self, path: &Path) {
+        self.apply(Op::RemoveFolder {
+            path: path.to_owned(),
+            exclude: true,
+        });
+        self.after_removal(path);
+        self.status = format!("Removed {} from the library", path.display());
+    }
+
+    /// Moves files and folders to the Recycle Bin and drops them from the library.
+    pub(crate) fn delete_paths(&mut self, paths: &[PathBuf]) {
+        let trash = self.trash.unwrap_or(move_to_trash);
+        let mut done = 0;
+        let mut failures = Vec::new();
+        for path in paths {
+            match trash(path) {
+                Ok(()) => {
+                    done += 1;
+                    self.apply(Op::RemoveFolder {
+                        path: path.clone(),
+                        exclude: false,
+                    });
+                    self.after_removal(path);
+                }
+                Err(e) => failures.push(format!("{}: {e}", path.display())),
+            }
+        }
+        self.status = match (done, failures.first()) {
+            (_, Some(first)) => format!("Could not delete {} item(s); {first}", failures.len()),
+            (1, None) => "Moved 1 item to the Recycle Bin".into(),
+            (n, None) => format!("Moved {n} items to the Recycle Bin"),
+        };
+    }
+
+    /// Moves the view off a folder that is gone.
+    fn after_removal(&mut self, removed: &Path) {
+        self.refresh_visible();
+        if let Collection::Folder(current) = &self.collection
+            && current.starts_with(removed)
+        {
+            let fallback = removed
+                .ancestors()
+                .skip(1)
+                .find(|p| self.folder(p).is_some())
+                .map_or(Collection::All, |p| Collection::Folder(p.to_owned()));
+            self.collection = fallback;
+            self.refresh_visible();
+        }
+    }
+}
+
+fn move_to_trash(path: &Path) -> Result<(), String> {
+    trash::delete(path).map_err(|e| e.to_string())
 }
 
 fn source(model: &Model) -> polyroom_preview::Source {
@@ -904,7 +1106,7 @@ mod tests {
             &serde_json::json!({"path": "C:/b"}),
         )
         .unwrap();
-        s.view = ViewMode::Loupe;
+        s.sort.choose(SortKey::Size);
 
         // Nothing is written until the change has settled...
         s.poll();
@@ -918,8 +1120,8 @@ mod tests {
 
         let s2 = reopened(&path);
         assert_eq!(s2.thumb_size, 300.0);
-        assert!(!s2.panels.left && s2.panels.right && s2.panels.filmstrip);
-        assert_eq!(s2.view, ViewMode::Loupe);
+        assert!(!s2.panels.left && s2.panels.right);
+        assert_eq!(s2.sort, s.sort);
         assert_eq!(s2.collection, Collection::Folder("C:/b".into()));
     }
 
@@ -933,18 +1135,15 @@ mod tests {
         let (a, b) = (s.catalog().models()[0].id, s.catalog().models()[1].id);
         let cube = Arc::new(polyroom_mesh::test_cube());
 
-        // Model `a` is open in the loupe with its mesh loaded.
-        s.view = ViewMode::Loupe;
+        // Model `a` is open in the preview pane with its mesh loaded.
         s.current = Some(a);
         s.update_loupe();
         s.loupe.mesh = Some(Arc::clone(&cube));
         s.loupe.loading = false;
         assert_eq!(s.loupe().id, Some(a));
 
-        // Back to the grid, then double-click `b`.
-        s.view = ViewMode::Grid;
+        // Then `b` is selected.
         s.current = Some(b);
-        s.view = ViewMode::Loupe;
         s.update_loupe();
 
         assert_eq!(s.loupe().id, Some(b));

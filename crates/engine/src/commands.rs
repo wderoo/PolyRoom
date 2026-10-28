@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 use crate::command::{Command, CommandRegistry, Key, Shortcut, always};
-use crate::{EngineError, Module, Request, Session, ViewMode};
+use crate::{EngineError, Request, Session};
 
 pub fn register_all(r: &mut CommandRegistry) {
     // File
@@ -30,80 +30,7 @@ pub fn register_all(r: &mut CommandRegistry) {
         },
     });
 
-    // Modules
-    r.register(Command {
-        id: "module.library",
-        label: "Library",
-        menu: "Window/Library",
-        shortcut: Some(Shortcut::ctrl(Key::Char('1'))),
-        enabled: always,
-        run: |s, _| {
-            s.module = Module::Library;
-            Ok(())
-        },
-    });
-    r.register(Command {
-        id: "module.viewer",
-        label: "Viewer",
-        menu: "Window/Viewer",
-        shortcut: Some(Shortcut::ctrl(Key::Char('2'))),
-        enabled: always,
-        run: |s, _| {
-            s.module = Module::Viewer;
-            Ok(())
-        },
-    });
-
     // View
-    r.register(Command {
-        id: "view.grid",
-        label: "Grid",
-        menu: "View/Grid",
-        shortcut: Some(Shortcut::key(Key::Char('g'))),
-        enabled: always,
-        run: |s, _| {
-            s.module = Module::Library;
-            s.view = ViewMode::Grid;
-            Ok(())
-        },
-    });
-    r.register(Command {
-        id: "view.loupe",
-        label: "Loupe",
-        menu: "View/Loupe",
-        shortcut: Some(Shortcut::key(Key::Char('e'))),
-        enabled: always,
-        run: |s, _| {
-            s.module = Module::Library;
-            s.view = ViewMode::Loupe;
-            Ok(())
-        },
-    });
-    r.register(Command {
-        id: "view.toggle_loupe",
-        label: "Toggle Grid / Loupe",
-        menu: "",
-        shortcut: Some(Shortcut::key(Key::Enter)),
-        enabled: always,
-        run: |s, _| {
-            s.view = match s.view {
-                ViewMode::Grid => ViewMode::Loupe,
-                ViewMode::Loupe => ViewMode::Grid,
-            };
-            Ok(())
-        },
-    });
-    r.register(Command {
-        id: "view.back_to_grid",
-        label: "Back to Grid",
-        menu: "",
-        shortcut: Some(Shortcut::key(Key::Escape)),
-        enabled: |s| s.view == ViewMode::Loupe,
-        run: |s, _| {
-            s.view = ViewMode::Grid;
-            Ok(())
-        },
-    });
     r.register(Command {
         id: "view.toggle_left_panel",
         label: "Left Panel",
@@ -127,27 +54,15 @@ pub fn register_all(r: &mut CommandRegistry) {
         },
     });
     r.register(Command {
-        id: "view.toggle_filmstrip",
-        label: "Filmstrip",
-        menu: "View/Panels/Filmstrip",
-        shortcut: Some(Shortcut::key(Key::Char('f'))),
-        enabled: always,
-        run: |s, _| {
-            s.panels.filmstrip = !s.panels.filmstrip;
-            Ok(())
-        },
-    });
-    r.register(Command {
         id: "view.toggle_all_panels",
         label: "All Panels",
         menu: "View/Panels/All Panels",
         shortcut: Some(Shortcut::key(Key::Tab)),
         enabled: always,
         run: |s, _| {
-            let show = !(s.panels.left || s.panels.right || s.panels.filmstrip);
+            let show = !(s.panels.left || s.panels.right);
             s.panels.left = show;
             s.panels.right = show;
-            s.panels.filmstrip = show;
             Ok(())
         },
     });
@@ -186,7 +101,7 @@ pub fn register_all(r: &mut CommandRegistry) {
         label: "Larger Thumbnails",
         menu: "View/Larger Thumbnails",
         shortcut: Some(Shortcut::key(Key::Plus)),
-        enabled: |s| s.view == ViewMode::Grid,
+        enabled: always,
         run: |s, _| {
             s.thumb_size = (s.thumb_size + 32.0).min(Session::THUMB_MAX);
             Ok(())
@@ -197,7 +112,7 @@ pub fn register_all(r: &mut CommandRegistry) {
         label: "Smaller Thumbnails",
         menu: "View/Smaller Thumbnails",
         shortcut: Some(Shortcut::key(Key::Minus)),
-        enabled: |s| s.view == ViewMode::Grid,
+        enabled: always,
         run: |s, _| {
             s.thumb_size = (s.thumb_size - 32.0).max(Session::THUMB_MIN);
             Ok(())
@@ -205,6 +120,7 @@ pub fn register_all(r: &mut CommandRegistry) {
     });
 
     crate::library::register(r);
+    crate::organize::register(r);
 
     // Help
     r.register(Command {
@@ -238,7 +154,7 @@ fn set_thumb_size(s: &mut Session, args: &Value) -> Result<(), EngineError> {
 mod tests {
     use serde_json::json;
 
-    use crate::{EngineError, Key, Request, Session, Shortcut, ViewMode, default_registry};
+    use crate::{EngineError, Key, Request, Session, Shortcut, default_registry};
 
     #[test]
     fn ids_and_shortcuts_are_unique() {
@@ -255,14 +171,12 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_dispatch_switches_view() {
+    fn shortcut_dispatch_runs_the_command() {
         let r = default_registry();
         let mut s = Session::new();
-        let id = r.find_shortcut(Shortcut::key(Key::Char('e'))).unwrap().id;
+        let id = r.find_shortcut(Shortcut::key(Key::Char(']'))).unwrap().id;
         r.run(id, &mut s, &json!({})).unwrap();
-        assert_eq!(s.view, ViewMode::Loupe);
-        r.run("view.back_to_grid", &mut s, &json!({})).unwrap();
-        assert_eq!(s.view, ViewMode::Grid);
+        assert!(!s.panels.right);
     }
 
     #[test]
@@ -270,7 +184,7 @@ mod tests {
         let r = default_registry();
         let mut s = Session::new();
         assert!(matches!(
-            r.run("view.back_to_grid", &mut s, &json!({})),
+            r.run("loupe.show_3d", &mut s, &json!({})),
             Err(EngineError::Disabled(_))
         ));
         assert!(matches!(
@@ -307,8 +221,8 @@ mod tests {
         let r = default_registry();
         let mut s = Session::new();
         r.run("view.toggle_all_panels", &mut s, &json!({})).unwrap();
-        assert!(!s.panels.left && !s.panels.right && !s.panels.filmstrip);
+        assert!(!s.panels.left && !s.panels.right);
         r.run("view.toggle_all_panels", &mut s, &json!({})).unwrap();
-        assert!(s.panels.left && s.panels.right && s.panels.filmstrip);
+        assert!(s.panels.left && s.panels.right);
     }
 }

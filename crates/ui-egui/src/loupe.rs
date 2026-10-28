@@ -1,4 +1,5 @@
-//! The 3D loupe: renders the current model with wgpu into a texture shown by egui.
+//! The 3D viewer of the preview pane: renders the current model with wgpu into a texture shown
+//! by egui.
 //! Left-drag orbits, right/middle-drag pans, the wheel zooms, double-click resets the view.
 
 use egui::{
@@ -17,8 +18,36 @@ use crate::{gizmo, theme};
 const CHIP: f32 = 56.0;
 const CHIP_GAP: f32 = 6.0;
 
-/// The centre background colour (#1c1c1e), matching [`theme::CENTER`].
+/// The default background colour (#1c1c1e), matching [`theme::CENTER`].
 const BACKGROUND: [f32; 4] = [28.0 / 255.0, 28.0 / 255.0, 30.0 / 255.0, 1.0];
+
+/// The background and model colour (sRGB) the view is drawn in.
+type Look = (Option<[u8; 3]>, [u8; 3]);
+
+fn srgb_to_linear(c: u8) -> f32 {
+    let c = f32::from(c) / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn look_style(look: Look, show_grid: bool) -> Style {
+    let (background, [r, g, b]) = look;
+    Style {
+        background: background.map_or(BACKGROUND, |[r, g, b]| {
+            [
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+                1.0,
+            ]
+        }),
+        base_color: [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)],
+        show_grid,
+    }
+}
 
 #[derive(Default)]
 pub struct LoupeView {
@@ -28,7 +57,7 @@ pub struct LoupeView {
     mesh: Option<(ModelId, GpuMesh)>,
     camera: Option<Camera>,
     /// The camera/size/mesh the texture was last rendered with.
-    rendered: Option<(Camera, u32, u32, ModelId, bool)>,
+    rendered: Option<(Camera, u32, u32, ModelId, bool, Look)>,
     upload_error: Option<String>,
     /// The image shown, as a texture, and which file it is of.
     picture: Option<(ModelId, egui::TextureHandle)>,
@@ -38,7 +67,7 @@ impl LoupeView {
     pub fn show(
         &mut self,
         ui: &mut Ui,
-        frame: &eframe::Frame,
+        render_state: Option<&egui_wgpu::RenderState>,
         session: &mut Session,
         thumbs: &mut ThumbTextures,
         actions: &mut Actions,
@@ -59,7 +88,7 @@ impl LoupeView {
         if format == Some(Format::Image) || photo.is_some() {
             self.show_picture(ui, rect, session);
         } else {
-            self.show_model(ui, rect, frame, session);
+            self.show_model(ui, rect, render_state, session);
         }
         let stack = session.stack(current).to_vec();
         if !stack.is_empty() {
@@ -67,12 +96,18 @@ impl LoupeView {
         }
     }
 
-    fn show_model(&mut self, ui: &mut Ui, rect: Rect, frame: &eframe::Frame, session: &Session) {
+    fn show_model(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        render_state: Option<&egui_wgpu::RenderState>,
+        session: &Session,
+    ) {
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme::CENTER);
 
-        let Some(render_state) = frame.wgpu_render_state() else {
+        let Some(render_state) = render_state else {
             centered(&painter, rect, "3D view needs the wgpu renderer");
             return;
         };
@@ -167,13 +202,11 @@ impl LoupeView {
         if let (Some(target), Some(camera), Some((id, gpu))) =
             (&self.target, self.camera, &self.mesh)
         {
-            let state = Some((camera, w, h, *id, session.show_bed_grid));
+            let preview = session.preview_settings();
+            let look = (preview.background, preview.model_color);
+            let state = Some((camera, w, h, *id, session.show_bed_grid, look));
             if self.rendered != state {
-                let style = Style {
-                    background: BACKGROUND,
-                    base_color: [0.62, 0.60, 0.57],
-                    show_grid: session.show_bed_grid,
-                };
+                let style = look_style(look, session.show_bed_grid);
                 renderer.render(
                     device,
                     &render_state.queue,
@@ -227,17 +260,48 @@ impl LoupeView {
                 theme::TEXT,
             );
         }
-        painter.text(
-            rect.left_bottom() + vec2(14.0, -10.0),
-            Align2::LEFT_BOTTOM,
-            "Drag to orbit · Right-drag to pan · Scroll to zoom · Double-click to reset · Click an axis to align",
-            FontId::proportional(11.0),
-            theme::TEXT_DIM,
-        );
+        if rect.width() >= 520.0 {
+            painter.text(
+                rect.left_bottom() + vec2(14.0, -10.0),
+                Align2::LEFT_BOTTOM,
+                "Drag to orbit · Right-drag to pan · Scroll to zoom · Double-click to reset · Click an axis to align",
+                FontId::proportional(11.0),
+                theme::TEXT_DIM,
+            );
+        }
+        if showing_current {
+            self.reset_button(ui, rect);
+        }
     }
 }
 
 impl LoupeView {
+    /// A "Reset" button in the top-right corner that fits the model back into view.
+    fn reset_button(&mut self, ui: &mut Ui, rect: Rect) {
+        let button = Rect::from_min_size(rect.right_top() + vec2(-62.0, 8.0), vec2(54.0, 22.0));
+        let response = ui.interact(button, ui.scope_id().with("reset-view"), Sense::click());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Reset view"));
+        let fill = if response.hovered() {
+            Color32::from_black_alpha(190)
+        } else {
+            Color32::from_black_alpha(140)
+        };
+        ui.painter()
+            .rect_filled(button, CornerRadius::same(4), fill);
+        ui.painter().text(
+            button.center(),
+            Align2::CENTER_CENTER,
+            "Reset",
+            FontId::proportional(12.0),
+            theme::TEXT,
+        );
+        if response.on_hover_text("Fit the model into view").clicked()
+            && let (Some(camera), Some((_, gpu))) = (&mut self.camera, &self.mesh)
+        {
+            *camera = Camera::fit(&gpu.bounds, rect.width() / rect.height().max(1.0));
+        }
+    }
+
     /// An image file, or a photo from the current model's stack, fitted into the view.
     fn show_picture(&mut self, ui: &mut Ui, rect: Rect, session: &Session) {
         ui.allocate_rect(rect, Sense::hover());

@@ -154,3 +154,25 @@ pub fn label_color(label: ColorLabel) -> Color32 {
         ColorLabel::Purple => Color32::from_rgb(0xa0, 0x6c, 0xd5),
     }
 }
+
+/// A heart: two round lobes over a point. Used for favorites.
+pub fn heart(painter: &Painter, rect: Rect, color: Color32) {
+    let (w, h) = (rect.width(), rect.height());
+    let radius = w * 0.27;
+    let lobes_y = rect.top() + h * 0.32;
+    for x in [0.27, 0.73] {
+        painter.circle_filled(pos2(rect.left() + w * x, lobes_y), radius, color);
+    }
+    painter.add(Shape::convex_polygon(
+        vec![
+            pos2(rect.left() + w * 0.03, lobes_y + h * 0.08),
+            pos2(rect.right() - w * 0.03, lobes_y + h * 0.08),
+            pos2(rect.center().x, rect.bottom()),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// The colour of a favorite heart.
+pub const HEART: Color32 = Color32::from_rgb(0xe0, 0x4f, 0x6a);

@@ -24,6 +24,8 @@ pub struct FolderNode {
     /// How many of `total` are images, and how many ZIP archives.
     pub images: usize,
     pub archives: usize,
+    /// Size in bytes of all files in this folder and its subfolders.
+    pub bytes: u64,
     /// A few files from this folder or below for the folder's preview; images and models with
     /// photos come first. Photos stacked on a model are left out (the model shows them).
     pub samples: Vec<ModelId>,
@@ -48,6 +50,7 @@ struct Counts {
     total: usize,
     images: usize,
     archives: usize,
+    bytes: u64,
     /// Sample candidates with a picture, and without one.
     pictured: Vec<ModelId>,
     plain: Vec<ModelId>,
@@ -72,6 +75,7 @@ pub fn build(roots: &[PathBuf], models: &[Model], stacks: &Stacks) -> Vec<Folder
                     }
                     let c = counts.entry(dir.to_owned()).or_default();
                     c.total += 1;
+                    c.bytes = c.bytes.saturating_add(m.size);
                     match m.format {
                         Format::Image => c.images += 1,
                         Format::Zip => c.archives += 1,
@@ -116,8 +120,14 @@ fn node(path: &Path, counts: &mut BTreeMap<PathBuf, Counts>) -> FolderNode {
         total: c.total,
         images: c.images,
         archives: c.archives,
+        bytes: c.bytes,
         samples: c.pictured,
     }
+}
+
+/// How many folders the trees hold, roots included.
+pub fn count(nodes: &[FolderNode]) -> usize {
+    nodes.iter().map(|n| 1 + count(&n.children)).sum()
 }
 
 fn name_of(path: &Path) -> String {

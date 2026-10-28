@@ -13,6 +13,7 @@ polyroom-render.workspace = true
 polyroom-catalog.workspace = true
 polyroom-preview.workspace = true
 directories.workspace = true
+trash.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

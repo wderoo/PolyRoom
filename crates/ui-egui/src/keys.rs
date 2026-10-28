@@ -9,6 +9,8 @@ fn map_key(key: EKey) -> Option<Key> {
         EKey::Escape => Key::Escape,
         EKey::Backspace => Key::Backspace,
         EKey::F5 => Key::F5,
+        EKey::Delete => Key::Delete,
+        EKey::Comma => Key::Char(','),
         EKey::Tab => Key::Tab,
         EKey::ArrowLeft => Key::Left,
         EKey::ArrowRight => Key::Right,

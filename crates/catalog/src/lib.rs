@@ -7,9 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+mod meta;
 mod scan;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use polyroom_mesh::MeshStats;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use meta::{Category, CategoryId, Meta, Target, clean_tag};
 pub use scan::{ScannedFile, scan_folder};
 
 pub type ModelId = u64;
@@ -38,6 +40,10 @@ pub enum CatalogError {
     },
     #[error("could not encode catalog data: {0}")]
     Encode(#[from] serde_json::Error),
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> CatalogError + '_ {
@@ -108,6 +114,8 @@ pub struct Model {
     pub label: Option<ColorLabel>,
     #[serde(default)]
     pub stats: Option<MeshStats>,
+    #[serde(default)]
+    pub meta: Meta,
     /// Why the file could not be loaded, if it couldn't.
     #[serde(default)]
     pub error: Option<String>,
@@ -161,6 +169,44 @@ pub enum Op {
     Remove {
         id: ModelId,
     },
+    /// Adds the default categories once per catalog.
+    SeedCategories,
+    AddCategory {
+        category: Category,
+    },
+    RenameCategory {
+        id: CategoryId,
+        name: String,
+    },
+    /// Also clears the category from everything that used it.
+    RemoveCategory {
+        id: CategoryId,
+    },
+    SetCategory {
+        target: Target,
+        category: Option<CategoryId>,
+    },
+    AddTag {
+        target: Target,
+        tag: String,
+    },
+    RemoveTag {
+        target: Target,
+        tag: String,
+    },
+    SetFavorite {
+        target: Target,
+        favorite: bool,
+    },
+    /// Drops a folder and its models from the library. A subfolder stays excluded, so
+    /// refreshing its parent does not bring it back. Files on disk are untouched.
+    RemoveFolder {
+        path: PathBuf,
+        /// Keep a removed subfolder out of later scans. A folder deleted from disk needs no
+        /// exclusion.
+        #[serde(default = "yes")]
+        exclude: bool,
+    },
 }
 
 /// What [`Catalog::sync`] changed.
@@ -176,6 +222,14 @@ pub struct SyncReport {
 struct Snapshot {
     folders: Vec<PathBuf>,
     models: Vec<Model>,
+    #[serde(default)]
+    categories: Vec<Category>,
+    #[serde(default)]
+    seeded: bool,
+    #[serde(default)]
+    folder_meta: Vec<(PathBuf, Meta)>,
+    #[serde(default)]
+    excluded: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -185,6 +239,11 @@ pub struct Catalog {
     ops_in_log: usize,
     folders: Vec<PathBuf>,
     models: Vec<Model>,
+    categories: Vec<Category>,
+    seeded: bool,
+    folder_meta: HashMap<PathBuf, Meta>,
+    /// Subfolders removed from the library; scans skip them.
+    excluded: Vec<PathBuf>,
     index: HashMap<ModelId, usize>,
     next_id: ModelId,
     last_import: u32,
@@ -193,6 +252,8 @@ pub struct Catalog {
     /// Bumped only when models or folders are added, removed or replaced, not on edits like
     /// ratings or stats; lets views cache lists and trees.
     layout_version: u64,
+    /// Bumped by edits of categories, tags and favorites.
+    meta_version: u64,
 }
 
 impl Catalog {
@@ -211,6 +272,10 @@ impl Catalog {
             Ok(bytes) => match serde_json::from_slice::<Snapshot>(&bytes) {
                 Ok(s) => {
                     catalog.folders = s.folders;
+                    catalog.categories = s.categories;
+                    catalog.seeded = s.seeded;
+                    catalog.folder_meta = s.folder_meta.into_iter().collect();
+                    catalog.excluded = s.excluded;
                     for m in s.models {
                         catalog.insert(m);
                     }
@@ -247,6 +312,9 @@ impl Catalog {
             catalog.compact()?;
         }
         catalog.open_log()?;
+        if !catalog.seeded {
+            catalog.apply(Op::SeedCategories)?;
+        }
         Ok(catalog)
     }
 
@@ -272,6 +340,14 @@ impl Catalog {
         let snapshot = Snapshot {
             folders: self.folders.clone(),
             models: self.models.clone(),
+            categories: self.categories.clone(),
+            seeded: self.seeded,
+            folder_meta: self
+                .folder_meta
+                .iter()
+                .map(|(p, m)| (p.clone(), m.clone()))
+                .collect(),
+            excluded: self.excluded.clone(),
         };
         let tmp = dir.join("snapshot.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&snapshot)?).map_err(io_err(&tmp))?;
@@ -339,7 +415,24 @@ impl Catalog {
         self.version += 1;
         if matches!(
             op,
-            Op::AddFolder { .. } | Op::AddModel { .. } | Op::UpdateFile { .. } | Op::Remove { .. }
+            Op::SeedCategories
+                | Op::AddCategory { .. }
+                | Op::RenameCategory { .. }
+                | Op::RemoveCategory { .. }
+                | Op::SetCategory { .. }
+                | Op::AddTag { .. }
+                | Op::RemoveTag { .. }
+                | Op::SetFavorite { .. }
+        ) {
+            self.meta_version += 1;
+        }
+        if matches!(
+            op,
+            Op::AddFolder { .. }
+                | Op::AddModel { .. }
+                | Op::UpdateFile { .. }
+                | Op::Remove { .. }
+                | Op::RemoveFolder { .. }
         ) {
             self.layout_version += 1;
         }
@@ -390,6 +483,99 @@ impl Catalog {
                     self.reindex();
                 }
             }
+            Op::SeedCategories => {
+                if !self.seeded {
+                    self.seeded = true;
+                    let next = self.next_category_id();
+                    for (offset, mut c) in (0..).zip(meta::default_categories()) {
+                        c.id = next + offset;
+                        self.categories.push(c);
+                    }
+                }
+            }
+            Op::AddCategory { category } => {
+                self.seeded = true;
+                if !self.categories.iter().any(|c| c.id == category.id) {
+                    self.categories.push(category);
+                }
+            }
+            Op::RenameCategory { id, name } => {
+                if let Some(c) = self.categories.iter_mut().find(|c| c.id == id) {
+                    c.name = name;
+                }
+            }
+            Op::RemoveCategory { id } => {
+                self.categories.retain(|c| c.id != id);
+                for m in &mut self.models {
+                    if m.meta.category == Some(id) {
+                        m.meta.category = None;
+                    }
+                }
+                for meta in self.folder_meta.values_mut() {
+                    if meta.category == Some(id) {
+                        meta.category = None;
+                    }
+                }
+                self.folder_meta.retain(|_, m| !m.is_empty());
+            }
+            Op::SetCategory { target, category } => {
+                if category.is_none_or(|id| self.categories.iter().any(|c| c.id == id)) {
+                    self.edit_meta(&target, |m| m.category = category);
+                }
+            }
+            Op::AddTag { target, tag } => {
+                if let Some(tag) = clean_tag(&tag) {
+                    self.edit_meta(&target, |m| {
+                        m.tags.insert(tag);
+                    });
+                }
+            }
+            Op::RemoveTag { target, tag } => {
+                self.edit_meta(&target, |m| {
+                    m.tags.remove(&tag);
+                });
+            }
+            Op::SetFavorite { target, favorite } => {
+                self.edit_meta(&target, |m| m.favorite = favorite);
+            }
+            Op::RemoveFolder { path, exclude } => {
+                self.folders.retain(|f| *f != path);
+                self.models.retain(|m| !m.path.starts_with(&path));
+                self.reindex();
+                self.folder_meta.retain(|p, _| !p.starts_with(&path));
+                self.excluded.retain(|e| !e.starts_with(&path));
+                // A removed root is simply gone; a removed subfolder must stay out of scans.
+                let inside_root = self.folders.iter().any(|f| path.starts_with(f));
+                if exclude && inside_root && !self.excluded.contains(&path) {
+                    self.excluded.push(path);
+                }
+            }
+        }
+    }
+
+    fn next_category_id(&self) -> CategoryId {
+        self.categories
+            .iter()
+            .map(|c| c.id)
+            .max()
+            .map_or(1, |m| m.saturating_add(1))
+    }
+
+    /// Edits the organising data of `target`; a folder entry that ends up empty is dropped.
+    fn edit_meta(&mut self, target: &Target, edit: impl FnOnce(&mut Meta)) {
+        match target {
+            Target::Model(id) => {
+                if let Some(m) = self.get_mut(*id) {
+                    edit(&mut m.meta);
+                }
+            }
+            Target::Folder(path) => {
+                let meta = self.folder_meta.entry(path.clone()).or_default();
+                edit(meta);
+                if meta.is_empty() {
+                    self.folder_meta.remove(path);
+                }
+            }
         }
     }
 
@@ -419,6 +605,83 @@ impl Catalog {
         &self.folders
     }
 
+    pub fn categories(&self) -> &[Category] {
+        &self.categories
+    }
+
+    /// A free id for a new category.
+    pub fn new_category_id(&self) -> CategoryId {
+        self.next_category_id()
+    }
+
+    pub fn folder_meta(&self, path: &Path) -> Option<&Meta> {
+        self.folder_meta.get(path)
+    }
+
+    /// The organising data of a model or folder (empty if it has none).
+    pub fn meta_of(&self, target: &Target) -> Meta {
+        match target {
+            Target::Model(id) => self.get(*id).map(|m| m.meta.clone()).unwrap_or_default(),
+            Target::Folder(p) => self.folder_meta.get(p).cloned().unwrap_or_default(),
+        }
+    }
+
+    /// The category of a model, or else of the nearest folder above it that has one.
+    pub fn effective_category(&self, model: &Model) -> Option<CategoryId> {
+        model
+            .meta
+            .category
+            .or_else(|| self.folder_category(&model.path))
+    }
+
+    /// The category of the nearest folder above `path` that has one.
+    pub fn folder_category(&self, path: &Path) -> Option<CategoryId> {
+        path.ancestors()
+            .skip(1)
+            .find_map(|a| self.folder_meta.get(a)?.category)
+    }
+
+    /// Whether a model, or a folder above it, is a favorite.
+    pub fn effective_favorite(&self, model: &Model) -> bool {
+        model.meta.favorite
+            || model
+                .path
+                .ancestors()
+                .skip(1)
+                .any(|a| self.folder_meta.get(a).is_some_and(|m| m.favorite))
+    }
+
+    /// A model's own tags plus those of the folders above it.
+    pub fn effective_tags(&self, model: &Model) -> BTreeSet<String> {
+        let mut tags = model.meta.tags.clone();
+        for a in model.path.ancestors().skip(1) {
+            if let Some(m) = self.folder_meta.get(a) {
+                tags.extend(m.tags.iter().cloned());
+            }
+        }
+        tags
+    }
+
+    /// Every tag in use, with the number of models and folders carrying it.
+    pub fn all_tags(&self) -> BTreeMap<String, usize> {
+        let mut out = BTreeMap::new();
+        let metas = self
+            .models
+            .iter()
+            .map(|m| &m.meta)
+            .chain(self.folder_meta.values());
+        for meta in metas {
+            for t in &meta.tags {
+                *out.entry(t.clone()).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        self.excluded.iter().any(|e| path.starts_with(e))
+    }
+
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -426,6 +689,11 @@ impl Catalog {
     /// Like [`Catalog::version`], but unchanged by edits that don't alter which models exist.
     pub fn layout_version(&self) -> u64 {
         self.layout_version
+    }
+
+    /// Like [`Catalog::version`], but only changed by categories, tags and favorites.
+    pub fn meta_version(&self) -> u64 {
+        self.meta_version
     }
 
     /// The import batch shown as "Previous Import" (0 if nothing was imported yet).
@@ -444,7 +712,7 @@ impl Catalog {
             self.models.iter().map(|m| m.path.as_path()).collect();
         let new: Vec<ScannedFile> = files
             .into_iter()
-            .filter(|f| !known.contains(f.path.as_path()))
+            .filter(|f| !known.contains(f.path.as_path()) && !self.is_excluded(&f.path))
             .collect();
         if !self.folders.iter().any(|f| f == folder) {
             self.apply(Op::AddFolder {
@@ -471,6 +739,7 @@ impl Catalog {
                 flag: Flag::None,
                 label: None,
                 stats: None,
+                meta: Meta::default(),
                 error: None,
             };
             self.apply(Op::AddModel {
@@ -709,5 +978,229 @@ mod tests {
         c.import(Path::new("C:/m"), vec![file("a.stl")]).unwrap();
         c.apply(Op::SetRating { id: 0, rating: 200 }).unwrap();
         assert_eq!(c.get(0).unwrap().rating, 5);
+    }
+
+    fn cat(id: CategoryId, name: &str) -> Category {
+        Category {
+            id,
+            name: name.to_owned(),
+            color: [1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn fresh_catalogs_get_default_categories_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = |c: &Catalog| {
+            c.categories()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut c = Catalog::open(dir.path()).unwrap();
+            assert_eq!(names(&c), ["Miniatures", "Functional", "Art", "Terrain"]);
+            let id = c.categories()[0].id;
+            c.apply(Op::RemoveCategory { id }).unwrap();
+        }
+        let c = Catalog::open(dir.path()).unwrap();
+        assert_eq!(names(&c), ["Functional", "Art", "Terrain"], "not reseeded");
+    }
+
+    #[test]
+    fn organising_edits_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = PathBuf::from("C:/models");
+        {
+            let mut c = Catalog::open(dir.path()).unwrap();
+            c.import(&folder, vec![file("a.stl")]).unwrap();
+            let art = c.categories()[2].id;
+            c.apply(Op::SetCategory {
+                target: Target::Model(0),
+                category: Some(art),
+            })
+            .unwrap();
+            c.apply(Op::AddTag {
+                target: Target::Model(0),
+                tag: "  Dragon ".into(),
+            })
+            .unwrap();
+            c.apply(Op::SetFavorite {
+                target: Target::Folder(folder.clone()),
+                favorite: true,
+            })
+            .unwrap();
+            c.compact().unwrap();
+            c.apply(Op::AddTag {
+                target: Target::Folder(folder.clone()),
+                tag: "Orc".into(),
+            })
+            .unwrap();
+        }
+        let c = Catalog::open(dir.path()).unwrap();
+        let m = c.get(0).unwrap();
+        assert_eq!(m.meta.category, Some(c.categories()[2].id));
+        assert_eq!(m.meta.tags.iter().collect::<Vec<_>>(), ["dragon"]);
+        let f = c.folder_meta(&folder).unwrap();
+        assert!(f.favorite);
+        assert!(f.tags.contains("orc"));
+        let tags = c.all_tags();
+        assert_eq!(tags.get("dragon"), Some(&1));
+        assert_eq!(
+            c.effective_tags(m).into_iter().collect::<Vec<_>>(),
+            ["dragon", "orc"]
+        );
+    }
+
+    #[test]
+    fn models_inherit_the_category_of_their_folder() {
+        let mut c = Catalog::in_memory();
+        let root = PathBuf::from("C:/models");
+        let sub = root.join("sub");
+        let nested = ScannedFile {
+            path: sub.join("a.stl"),
+            ..file("a.stl")
+        };
+        c.import(&root, vec![nested, file("top.stl")]).unwrap();
+        c.apply(Op::AddCategory {
+            category: cat(7, "Art"),
+        })
+        .unwrap();
+        c.apply(Op::SetCategory {
+            target: Target::Folder(sub),
+            category: Some(7),
+        })
+        .unwrap();
+        fn by_name<'a>(c: &'a Catalog, n: &str) -> &'a Model {
+            c.models().iter().find(|m| m.name() == n).unwrap()
+        }
+        assert_eq!(c.effective_category(by_name(&c, "a.stl")), Some(7));
+        assert_eq!(c.effective_category(by_name(&c, "top.stl")), None);
+
+        c.apply(Op::SetCategory {
+            target: Target::Model(0),
+            category: None,
+        })
+        .unwrap();
+        c.apply(Op::RemoveCategory { id: 7 }).unwrap();
+        assert_eq!(c.effective_category(by_name(&c, "a.stl")), None);
+        assert!(
+            c.folder_meta(&root.join("sub")).is_none(),
+            "empty meta dropped"
+        );
+    }
+
+    #[test]
+    fn a_model_in_a_favorite_folder_is_a_favorite() {
+        let mut c = Catalog::in_memory();
+        let root = PathBuf::from("C:/models");
+        let nested = ScannedFile {
+            path: root.join("sub").join("a.stl"),
+            ..file("a.stl")
+        };
+        c.import(&root, vec![nested, file("top.stl")]).unwrap();
+        c.apply(Op::SetFavorite {
+            target: Target::Folder(root.join("sub")),
+            favorite: true,
+        })
+        .unwrap();
+        let favorite = |c: &Catalog, name: &str| {
+            let m = c.models().iter().find(|m| m.name() == name).unwrap();
+            c.effective_favorite(m)
+        };
+        assert!(favorite(&c, "a.stl"));
+        assert!(!favorite(&c, "top.stl"));
+    }
+
+    #[test]
+    fn unknown_categories_and_blank_tags_are_ignored() {
+        let mut c = Catalog::in_memory();
+        c.import(Path::new("C:/m"), vec![file("a.stl")]).unwrap();
+        c.apply(Op::SetCategory {
+            target: Target::Model(0),
+            category: Some(99),
+        })
+        .unwrap();
+        c.apply(Op::AddTag {
+            target: Target::Model(0),
+            tag: "   ".into(),
+        })
+        .unwrap();
+        assert!(c.get(0).unwrap().meta.is_empty());
+    }
+
+    #[test]
+    fn removing_a_root_drops_its_models_and_metadata() {
+        let mut c = Catalog::in_memory();
+        let (a, b) = (PathBuf::from("C:/a"), PathBuf::from("C:/b"));
+        let in_a = ScannedFile {
+            path: a.join("x.stl"),
+            ..file("x.stl")
+        };
+        let in_b = ScannedFile {
+            path: b.join("y.stl"),
+            ..file("y.stl")
+        };
+        c.import(&a, vec![in_a]).unwrap();
+        c.import(&b, vec![in_b]).unwrap();
+        c.apply(Op::SetFavorite {
+            target: Target::Folder(a.clone()),
+            favorite: true,
+        })
+        .unwrap();
+        let layout = c.layout_version();
+        c.apply(Op::RemoveFolder {
+            path: a.clone(),
+            exclude: true,
+        })
+        .unwrap();
+        assert!(c.layout_version() > layout);
+        assert_eq!(c.folders(), [b]);
+        assert_eq!(c.models().len(), 1);
+        assert!(c.get(1).is_some() && c.get(0).is_none());
+        assert!(c.folder_meta(&a).is_none());
+        assert!(!c.is_excluded(&a), "a removed root may be imported again");
+    }
+
+    #[test]
+    fn a_removed_subfolder_stays_out_after_sync_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("C:/models");
+        let sub = root.join("sub");
+        let in_sub = ScannedFile {
+            path: sub.join("a.stl"),
+            ..file("a.stl")
+        };
+        {
+            let mut c = Catalog::open(dir.path()).unwrap();
+            c.import(&root, vec![file("top.stl"), in_sub.clone()])
+                .unwrap();
+            c.apply(Op::RemoveFolder {
+                path: sub.clone(),
+                exclude: true,
+            })
+            .unwrap();
+            assert_eq!(c.models().len(), 1);
+            let report = c
+                .sync(&root, &root, vec![file("top.stl"), in_sub.clone()])
+                .unwrap();
+            assert_eq!(report, SyncReport::default());
+        }
+        let mut c = Catalog::open(dir.path()).unwrap();
+        assert!(c.is_excluded(&sub.join("deeper")));
+        c.sync(&root, &root, vec![file("top.stl"), in_sub]).unwrap();
+        assert_eq!(c.models().len(), 1);
+    }
+
+    #[test]
+    fn snapshots_from_before_organising_data_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"folders":["C:/m"],"models":[{"id":0,"path":"C:/m/a.stl","folder":"C:/m",
+            "format":"Stl","size":5,"modified":null,"added":1,"import":1,"rating":3}]}"#;
+        std::fs::write(dir.path().join(SNAPSHOT), old).unwrap();
+        let c = Catalog::open(dir.path()).unwrap();
+        assert_eq!(c.get(0).unwrap().rating, 3);
+        assert!(c.get(0).unwrap().meta.is_empty());
+        assert_eq!(c.categories().len(), 4);
     }
 }

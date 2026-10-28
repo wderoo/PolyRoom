@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use egui::collapsing_header::CollapsingState;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Rect, Sense, Ui, pos2, vec2};
-use polyroom_engine::{Collection, FolderNode};
+use polyroom_engine::{Collection, FolderNode, Session};
 use serde_json::json;
 
 use crate::layout::Actions;
-use crate::{icons, theme};
+use crate::{icons, meta_ui, theme};
 
 /// Remembers which folder to reveal (expand the ancestors of) after navigating to it from
 /// somewhere other than the tree, e.g. by double-clicking a folder in the grid.
@@ -32,7 +32,10 @@ impl TreeState {
 }
 
 /// The actions for a folder, used by the right-click menu and the "⋯" button alike.
-pub fn folder_menu(ui: &mut Ui, path: &Path, actions: &mut Actions) {
+pub fn folder_menu(ui: &mut Ui, path: &Path, session: &Session, actions: &mut Actions) {
+    let meta = session.catalog().folder_meta(path);
+    let favorite = meta.is_some_and(|m| m.favorite);
+    let category = meta.and_then(|m| m.category);
     if ui
         .button("Refresh Folder")
         .on_hover_text("Rescan for new, changed and deleted files")
@@ -40,8 +43,39 @@ pub fn folder_menu(ui: &mut Ui, path: &Path, actions: &mut Actions) {
     {
         actions.push_args("library.refresh_folder", json!({ "path": path }));
     }
-    if ui.button("Show in Explorer").clicked() {
-        actions.push_args("library.show_in_explorer", json!({ "path": path }));
+    if ui.button("Reveal in File Explorer").clicked() {
+        actions.push_args("file.reveal", json!({ "path": path }));
+    }
+    ui.separator();
+    let label = if favorite {
+        "Remove from Favorites"
+    } else {
+        "Add to Favorites"
+    };
+    if ui.button(label).clicked() {
+        actions.push_args("meta.favorite.toggle", json!({ "path": path }));
+    }
+    ui.menu_button("Category", |ui| {
+        meta_ui::category_items(ui, session, category, Some(path), actions);
+    });
+    if ui.button("Regenerate Thumbnails").clicked() {
+        actions.push_args("preview.regenerate", json!({ "path": path }));
+    }
+    ui.separator();
+    if ui
+        .button("Remove from Library…")
+        .on_hover_text("The files stay on disk")
+        .clicked()
+    {
+        actions.push_args("library.remove_folder", json!({ "path": path }));
+    }
+    let delete = egui::RichText::new("Delete…").color(egui::Color32::from_rgb(0xe0, 0x60, 0x60));
+    if ui
+        .button(delete)
+        .on_hover_text("Move the folder to the Recycle Bin")
+        .clicked()
+    {
+        actions.push_args("file.delete", json!({ "path": path }));
     }
 }
 
@@ -53,6 +87,7 @@ pub fn dots_button(
     id: egui::Id,
     path: &Path,
     emphasize: bool,
+    session: &Session,
     actions: &mut Actions,
 ) {
     let response = ui
@@ -70,18 +105,19 @@ pub fn dots_button(
         (false, false) => theme::TEXT_DIM.gamma_multiply(0.45),
     };
     icons::dots(ui.painter(), rect, color);
-    egui::Popup::menu(&response).show(|ui| folder_menu(ui, path, actions));
+    egui::Popup::menu(&response).show(|ui| folder_menu(ui, path, session, actions));
 }
 
 pub fn folder_tree(
     ui: &mut Ui,
     roots: &[FolderNode],
     current: Option<&Path>,
+    session: &Session,
     state: &mut TreeState,
     actions: &mut Actions,
 ) {
     for root in roots {
-        node(ui, root, current, state, actions, true);
+        node(ui, root, current, session, state, actions, true);
     }
     state.reveal = None;
 }
@@ -122,7 +158,14 @@ fn row_label(
 /// One tree row: `name …        count  ⋯`. Laid out by hand so that the count and the dots
 /// line up at the panel's right edge at every depth, and long names are truncated instead of
 /// widening the panel.
-fn folder_row(ui: &mut Ui, n: &FolderNode, selected: bool, is_root: bool, actions: &mut Actions) {
+fn folder_row(
+    ui: &mut Ui,
+    n: &FolderNode,
+    selected: bool,
+    is_root: bool,
+    session: &Session,
+    actions: &mut Actions,
+) {
     const DOTS: f32 = 20.0;
     const PAD: f32 = 6.0;
     let height = ui.spacing().interact_size.y;
@@ -194,7 +237,7 @@ fn folder_row(ui: &mut Ui, n: &FolderNode, selected: bool, is_root: bool, action
     if response.clicked() {
         actions.push_args("library.show_folder", json!({ "path": n.path }));
     }
-    response.context_menu(|ui| folder_menu(ui, &n.path, actions));
+    response.context_menu(|ui| folder_menu(ui, &n.path, session, actions));
     let row_hovered = ui.rect_contains_pointer(rect);
     dots_button(
         ui,
@@ -202,6 +245,7 @@ fn folder_row(ui: &mut Ui, n: &FolderNode, selected: bool, is_root: bool, action
         ui.make_persistent_id(("dots", &n.path)),
         &n.path,
         row_hovered || selected,
+        session,
         actions,
     );
     response.on_hover_text(n.path.display().to_string());
@@ -211,12 +255,13 @@ fn node(
     ui: &mut Ui,
     n: &FolderNode,
     current: Option<&Path>,
+    session: &Session,
     state: &TreeState,
     actions: &mut Actions,
     is_root: bool,
 ) {
     let selected = current == Some(n.path.as_path());
-    let mut row = |ui: &mut Ui| folder_row(ui, n, selected, is_root, actions);
+    let mut row = |ui: &mut Ui| folder_row(ui, n, selected, is_root, session, actions);
 
     if n.children.is_empty() {
         // Line leaves up with the labels of expandable siblings.
@@ -238,7 +283,7 @@ fn node(
     }
     collapsing.show_header(ui, row).body(|ui| {
         for child in &n.children {
-            node(ui, child, current, state, actions, false);
+            node(ui, child, current, session, state, actions, false);
         }
     });
 }
@@ -259,6 +304,7 @@ mod tests {
             total,
             images: 0,
             archives: 0,
+            bytes: 0,
             samples: Vec::new(),
         }
     }
@@ -353,6 +399,7 @@ mod tests {
                         ui,
                         &roots,
                         Some(current.as_path()),
+                        &polyroom_engine::Session::new(),
                         &mut state,
                         &mut actions,
                     );

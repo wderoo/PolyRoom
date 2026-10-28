@@ -452,8 +452,18 @@ impl Headless {
         })
     }
 
-    /// Renders a square three-quarter view of `mesh`.
+    /// Renders a square three-quarter view of `mesh` in the default thumbnail style.
     pub fn thumbnail(&self, mesh: &Mesh, size: u32) -> Result<Image, RenderError> {
+        self.thumbnail_styled(mesh, size, &Style::THUMBNAIL)
+    }
+
+    /// Like [`Headless::thumbnail`], with the colours of `style`.
+    pub fn thumbnail_styled(
+        &self,
+        mesh: &Mesh,
+        size: u32,
+        style: &Style,
+    ) -> Result<Image, RenderError> {
         let gpu = self.renderer.upload(&self.device, mesh)?;
         let target = Target::new(&self.device, size, size);
         let camera = Camera::fit(&gpu.bounds, 1.0);
@@ -463,7 +473,7 @@ impl Headless {
             &target,
             Some(&gpu),
             &camera,
-            &Style::THUMBNAIL,
+            style,
         );
         self.read_back(&target)
     }

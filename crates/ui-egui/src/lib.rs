@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod dialogs;
 mod format;
 mod gizmo;
 mod grid;
@@ -11,36 +12,46 @@ mod keys;
 mod layout;
 mod loupe;
 mod menu;
+mod meta_ui;
+mod preview;
 mod theme;
 mod thumbs;
+mod topbar;
 mod tree;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use egui::{Frame, Margin, RichText};
 use polyroom_engine::{
-    CommandRegistry, Module, Paths, Request, Session, ViewMode, default_registry,
+    CommandRegistry, Paths, PreviewSettings, Request, Session, default_registry,
 };
 use serde_json::{Value, json};
+
+use dialogs::{Answer, Dialog};
 
 pub struct PolyRoomApp {
     session: Session,
     registry: CommandRegistry,
     thumbs: thumbs::ThumbTextures,
     grid: grid::GridState,
-    filmstrip: grid::GridState,
     loupe: loupe::LoupeView,
     tree: tree::TreeState,
-    /// Text in the filter box (the engine holds the applied filter).
-    filter: String,
+    left: layout::LeftState,
+    topbar: topbar::TopbarState,
+    preview: preview::PreviewState,
     show_shortcuts: bool,
+    /// A question waiting for an answer before something is deleted or removed.
+    dialog: Option<Dialog>,
+    /// The settings window, while it is open, with the values its controls edit.
+    settings_draft: Option<PreviewSettings>,
     /// A command ran since the last frame was drawn, so what's on screen is stale.
     dirty: bool,
 }
 
 impl PolyRoomApp {
     /// Creates the app; `import` is a folder to import at startup (from `--import`).
-    pub fn new(cc: &eframe::CreationContext<'_>, import: Option<std::path::PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, import: Option<PathBuf>) -> Self {
         theme::apply(&cc.egui_ctx);
         let session = match Paths::for_user().map(|p| Session::open(&p)) {
             Some(Ok(session)) => session,
@@ -59,15 +70,21 @@ impl PolyRoomApp {
             }
         };
         let mut app = Self {
-            filter: session.filter().to_owned(),
+            topbar: topbar::TopbarState {
+                filter: session.filter().to_owned(),
+                ..topbar::TopbarState::default()
+            },
             session,
             registry: default_registry(),
             thumbs: thumbs::ThumbTextures::default(),
             grid: grid::GridState::default(),
-            filmstrip: grid::GridState::default(),
             loupe: loupe::LoupeView::default(),
             tree: tree::TreeState::default(),
+            left: layout::LeftState::default(),
+            preview: preview::PreviewState::default(),
             show_shortcuts: false,
+            dialog: None,
+            settings_draft: None,
             dirty: false,
         };
         if let Some(dir) = import {
@@ -84,9 +101,13 @@ impl PolyRoomApp {
         }
     }
 
+    fn modal_open(&self) -> bool {
+        self.show_shortcuts || self.dialog.is_some() || self.settings_draft.is_some()
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // Let text fields keep their keystrokes.
-        if ctx.egui_wants_keyboard_input() {
+        // Let text fields keep their keystrokes, and keep keys away from what is behind a modal.
+        if ctx.egui_wants_keyboard_input() || self.modal_open() {
             return;
         }
         for shortcut in keys::pressed_shortcuts(ctx) {
@@ -112,7 +133,17 @@ impl PolyRoomApp {
                     }
                 }
                 Request::ShowShortcuts => self.show_shortcuts = true,
-                Request::ShowInExplorer(path) => show_in_file_manager(&path, &mut self.session),
+                Request::ShowInExplorer(path) | Request::OpenFile(path) => {
+                    open_in_file_manager(&path, &mut self.session);
+                }
+                Request::RevealFile(path) => reveal_in_file_manager(&path, &mut self.session),
+                Request::ConfirmDelete(paths) => self.dialog = Some(Dialog::Delete(paths)),
+                Request::ConfirmRemoveFolder(path) => {
+                    self.dialog = Some(Dialog::RemoveFolder(path));
+                }
+                Request::ShowSettings => {
+                    self.settings_draft = Some(self.session.preview_settings());
+                }
                 Request::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
@@ -148,25 +179,45 @@ impl PolyRoomApp {
         }
     }
 
-    fn center(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, actions: &mut layout::Actions) {
+    /// The questions and the settings; what they decide is added to `actions`.
+    fn dialogs(&mut self, ctx: &egui::Context, actions: &mut layout::Actions) {
+        self.shortcuts_window(ctx);
+        if let Some(dialog) = self.dialog.clone()
+            && let Some(answer) = dialogs::confirm(ctx, &dialog)
+        {
+            self.dialog = None;
+            if answer == Answer::Confirm {
+                match dialog {
+                    Dialog::Delete(paths) => {
+                        actions.push_args("file.delete_confirmed", json!({ "paths": paths }));
+                    }
+                    Dialog::RemoveFolder(path) => {
+                        actions
+                            .push_args("library.remove_folder_confirmed", json!({ "path": path }));
+                    }
+                }
+            }
+        }
+        if let Some(mut draft) = self.settings_draft.take() {
+            let close =
+                dialogs::settings(ctx, self.session.preview_settings(), &mut draft, actions);
+            if !close {
+                self.settings_draft = Some(draft);
+            }
+        }
+    }
+
+    fn center(&mut self, ui: &mut egui::Ui, actions: &mut layout::Actions) {
         egui::CentralPanel::no_frame()
             .frame(Frame::new().fill(theme::CENTER))
             .show(ui, |ui| {
-                let show_loupe =
-                    self.session.module == Module::Viewer || self.session.view == ViewMode::Loupe;
                 if self.session.catalog().models().is_empty() {
                     layout::empty_library(ui, actions);
-                } else if show_loupe {
-                    self.loupe
-                        .show(ui, frame, &mut self.session, &mut self.thumbs, actions);
+                } else if self.session.visible().is_empty()
+                    && self.session.visible_folders().is_empty()
+                {
+                    layout::no_matches(ui);
                 } else {
-                    layout::breadcrumbs(ui, &self.session, actions);
-                    if self.session.visible().is_empty()
-                        && self.session.visible_folders().is_empty()
-                    {
-                        layout::no_matches(ui);
-                        return;
-                    }
                     grid::grid(
                         ui,
                         &mut self.session,
@@ -179,8 +230,9 @@ impl PolyRoomApp {
     }
 }
 
-/// Opens `path` in the platform's file manager.
-fn show_in_file_manager(path: &std::path::Path, session: &mut Session) {
+/// Opens `path` with the platform's default handler: a folder in the file manager, a file in
+/// the application for its type.
+fn open_in_file_manager(path: &Path, session: &mut Session) {
     let program = if cfg!(windows) {
         "explorer"
     } else if cfg!(target_os = "macos") {
@@ -191,6 +243,38 @@ fn show_in_file_manager(path: &std::path::Path, session: &mut Session) {
     if let Err(e) = std::process::Command::new(program).arg(path).spawn() {
         session.set_status(format!("Could not open {}: {e}", path.display()));
     }
+}
+
+/// Shows `path` selected in the platform's file manager.
+fn reveal_in_file_manager(path: &Path, session: &mut Session) {
+    if let Err(e) = reveal_command(path) {
+        session.set_status(format!("Could not show {}: {e}", path.display()));
+    }
+}
+
+#[cfg(windows)]
+fn reveal_command(path: &Path) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    // Explorer wants backslashes, and the whole argument quoted by hand.
+    let path = path.display().to_string().replace('/', "\\");
+    std::process::Command::new("explorer")
+        .raw_arg(format!("/select,\"{path}\""))
+        .spawn()
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_command(path: &Path) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn reveal_command(path: &Path) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("xdg-open")
+        .arg(path.parent().unwrap_or(path))
+        .spawn()
 }
 
 impl eframe::App for PolyRoomApp {
@@ -216,7 +300,6 @@ impl eframe::App for PolyRoomApp {
                 actions.push(id);
             }
         });
-        layout::module_bar(ui, &self.session, &mut actions);
         egui::Panel::bottom("status_bar")
             .frame(
                 Frame::new()
@@ -224,36 +307,34 @@ impl eframe::App for PolyRoomApp {
                     .inner_margin(Margin::symmetric(10, 3)),
             )
             .show(ui, |ui| {
-                status_bar(ui, self.session.status(), self.session.progress().as_ref());
+                status_bar(
+                    ui,
+                    &library_counts(&self.session),
+                    self.session.status(),
+                    self.session.progress().as_ref(),
+                );
             });
-        if self.session.module == Module::Library {
-            let film_open = self.session.panels.filmstrip;
-            let mut open = film_open;
-            egui::Panel::bottom("filmstrip")
-                .exact_size(96.0)
-                .frame(
-                    Frame::new()
-                        .fill(theme::HEADER)
-                        .inner_margin(Margin::same(6)),
-                )
-                .show_collapsible(ui, &mut open, |ui| {
-                    grid::filmstrip(
-                        ui,
-                        &mut self.session,
-                        &mut self.thumbs,
-                        &mut self.filmstrip,
-                        &mut actions,
-                    );
-                });
-            if open != film_open {
-                actions.push("view.toggle_filmstrip");
-            }
-            layout::toolbar(ui, &self.session, &mut self.filter, &mut actions);
-            layout::left_panel(ui, &self.session, &mut self.tree, &mut actions);
+        layout::left_panel(
+            ui,
+            &self.session,
+            &mut self.tree,
+            &mut self.left,
+            &mut actions,
+        );
+        preview::right_panel(
+            ui,
+            &mut self.session,
+            &mut self.loupe,
+            frame.wgpu_render_state(),
+            &mut self.thumbs,
+            &mut self.preview,
+            &mut actions,
+        );
+        if !self.session.catalog().models().is_empty() {
+            topbar::topbar(ui, &self.session, &mut self.topbar, &mut actions);
         }
-        layout::right_panel(ui, &mut self.session, &mut actions);
-        self.center(ui, frame, &mut actions);
-        self.shortcuts_window(&ctx);
+        self.center(ui, &mut actions);
+        self.dialogs(&ctx, &mut actions);
 
         for (id, args) in actions.list {
             self.dispatch(id, &args);
@@ -274,12 +355,44 @@ impl eframe::App for PolyRoomApp {
     }
 }
 
-/// The status line, with a progress bar (or spinner while the amount of work is unknown) at the
-/// right edge while background work runs.
-fn status_bar(ui: &mut egui::Ui, status: &str, progress: Option<&polyroom_engine::Progress>) {
+/// `401 folders · 1,240 files · 40.2 GB`, plus the selection when there are several models.
+fn library_counts(session: &Session) -> String {
+    let stats = session.library_stats();
+    let plural = |n: usize, word: &str| {
+        format!(
+            "{} {word}{}",
+            format::count(n as u64),
+            if n == 1 { "" } else { "s" }
+        )
+    };
+    let mut text = format!(
+        "{} · {} · {}",
+        plural(stats.folders, "folder"),
+        plural(stats.files, "file"),
+        format::bytes(stats.bytes)
+    );
+    let (selected, bytes) = session.selection_stats();
+    if selected > 1 {
+        text += &format!(" · {selected} selected ({})", format::bytes(bytes));
+    }
+    text
+}
+
+/// The library totals and status line, with a progress bar (or spinner while the amount of work
+/// is unknown) at the right edge while background work runs.
+fn status_bar(
+    ui: &mut egui::Ui,
+    counts: &str,
+    status: &str,
+    progress: Option<&polyroom_engine::Progress>,
+) {
     const BAR: f32 = 260.0;
     ui.horizontal(|ui| {
-        ui.label(RichText::new(status).color(theme::TEXT_DIM).small());
+        ui.label(RichText::new(counts).color(theme::TEXT).small());
+        if !status.is_empty() {
+            ui.label(RichText::new("·").color(theme::TEXT_DIM).small());
+            ui.label(RichText::new(status).color(theme::TEXT_DIM).small());
+        }
         let Some(progress) = progress else {
             return;
         };
@@ -328,21 +441,149 @@ mod tests {
             fraction: Some(0.3),
         };
         let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(700.0, 30.0))
+            .with_size(egui::vec2(900.0, 30.0))
             .build_ui(|ui| {
                 theme::apply(ui.ctx());
                 Frame::new()
                     .fill(theme::HEADER)
                     .inner_margin(Margin::symmetric(10, 3))
                     .show(ui, |ui| {
-                        status_bar(ui, "4000 models in library", Some(&progress));
+                        status_bar(
+                            ui,
+                            "401 folders · 1,240 files · 40.2 GB",
+                            "",
+                            Some(&progress),
+                        );
                     });
             });
         harness.run();
         // The bar's text is exposed to accessibility, so it is on screen.
         harness.get_by_label_contains("Generating previews 120 / 400");
+        harness.get_by_label("401 folders · 1,240 files · 40.2 GB");
         if let Ok(image) = harness.render() {
             let out = std::env::temp_dir().join("polyroom_status_bar.png");
+            image.save(&out).unwrap();
+            eprintln!("rendered {}", out.display());
+        }
+    }
+
+    #[test]
+    fn the_status_bar_counts_folders_files_and_size_and_the_selection() {
+        let files = ["a.stl", "b.stl", "sub/c.stl"].map(String::from);
+        let (_dir, mut session) = test_support::imported(&files);
+        assert_eq!(library_counts(&session), "2 folders · 3 files · 3 B");
+
+        default_registry()
+            .run("select.all", &mut session, &Value::Null)
+            .unwrap();
+        assert_eq!(
+            library_counts(&session),
+            "2 folders · 3 files · 3 B · 2 selected (2 B)",
+            "the root folder shows two files"
+        );
+    }
+    /// Every panel together, as the app lays them out; the picture goes to the temp folder.
+    #[test]
+    fn the_library_layout_draws_every_panel() {
+        let _gpu = crate::GPU_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct Parts {
+            session: Session,
+            registry: CommandRegistry,
+            thumbs: thumbs::ThumbTextures,
+            grid: grid::GridState,
+            loupe: loupe::LoupeView,
+            tree: tree::TreeState,
+            left: layout::LeftState,
+            topbar: topbar::TopbarState,
+            preview: preview::PreviewState,
+        }
+        let files: Vec<String> = [
+            "dragon.stl",
+            "knight.stl",
+            "orc.stl",
+            "minis/elf.stl",
+            "terrain/hill.stl",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (dir, mut session) = test_support::imported(&files);
+        std::mem::forget(dir);
+        let registry = default_registry();
+        let root = session.catalog().folders()[0].clone();
+        for (id, args) in [
+            ("category.add", json!({ "name": "Miniatures" })),
+            ("category.add", json!({ "name": "Terrain" })),
+            (
+                "meta.category",
+                json!({ "id": 1, "path": root.join("minis") }),
+            ),
+            (
+                "meta.tag.add",
+                json!({ "tag": "fantasy", "path": root.join("minis") }),
+            ),
+            (
+                "meta.favorite.toggle",
+                json!({ "path": root.join("terrain") }),
+            ),
+        ] {
+            registry.run(id, &mut session, &args).unwrap();
+        }
+        session.poll();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 800.0))
+            .build_ui_state(
+                |ui, p: &mut Parts| {
+                    theme::apply(ui.ctx());
+                    p.session.poll();
+                    let mut actions = layout::Actions::default();
+                    egui::Panel::bottom("status").show(ui, |ui| {
+                        status_bar(ui, &library_counts(&p.session), p.session.status(), None);
+                    });
+                    layout::left_panel(ui, &p.session, &mut p.tree, &mut p.left, &mut actions);
+                    preview::right_panel(
+                        ui,
+                        &mut p.session,
+                        &mut p.loupe,
+                        None,
+                        &mut p.thumbs,
+                        &mut p.preview,
+                        &mut actions,
+                    );
+                    topbar::topbar(ui, &p.session, &mut p.topbar, &mut actions);
+                    egui::CentralPanel::no_frame().show(ui, |ui| {
+                        grid::grid(ui, &mut p.session, &mut p.thumbs, &mut p.grid, &mut actions);
+                    });
+                    for (id, args) in actions.list {
+                        p.registry.run(id, &mut p.session, &args).unwrap();
+                    }
+                },
+                Parts {
+                    session,
+                    registry: default_registry(),
+                    thumbs: thumbs::ThumbTextures::default(),
+                    grid: grid::GridState::default(),
+                    loupe: loupe::LoupeView::default(),
+                    tree: tree::TreeState::default(),
+                    left: layout::LeftState::default(),
+                    topbar: topbar::TopbarState::default(),
+                    preview: preview::PreviewState::default(),
+                },
+            );
+        harness.run_steps(5);
+        let parts = harness.state_mut();
+        parts
+            .registry
+            .run("select.all", &mut parts.session, &Value::Null)
+            .unwrap();
+        harness.run_steps(5);
+        for label in ["Categories", "Tags", "Favorites"] {
+            assert!(harness.query_all_by_label(label).count() >= 1, "{label}");
+        }
+        assert!(harness.query_all_by_label_contains("selected").count() >= 1);
+        if let Ok(image) = harness.render() {
+            let out = std::env::temp_dir().join("polyroom_layout.png");
             image.save(&out).unwrap();
             eprintln!("rendered {}", out.display());
         }

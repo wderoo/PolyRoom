@@ -10,7 +10,11 @@ use serde_json::Value;
 use crate::command::{Command, CommandRegistry, Key, Shortcut, always};
 use crate::{Collection, EngineError, Session};
 
-fn arg_str<'a>(command: &str, args: &'a Value, key: &str) -> Result<&'a str, EngineError> {
+pub(crate) fn arg_str<'a>(
+    command: &str,
+    args: &'a Value,
+    key: &str,
+) -> Result<&'a str, EngineError> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| EngineError::InvalidArgument {
@@ -19,7 +23,7 @@ fn arg_str<'a>(command: &str, args: &'a Value, key: &str) -> Result<&'a str, Eng
         })
 }
 
-fn unknown(command: &str, key: &str, value: &str) -> EngineError {
+pub(crate) fn unknown(command: &str, key: &str, value: &str) -> EngineError {
     EngineError::InvalidArgument {
         command: command.into(),
         reason: format!("unknown {key} \"{value}\""),
@@ -35,7 +39,7 @@ fn current_folder(s: &Session) -> Option<PathBuf> {
 }
 
 /// `{"path": "..."}`, or the folder being browsed when no path is given (menu, shortcut).
-fn folder_arg(command: &str, s: &Session, args: &Value) -> Result<PathBuf, EngineError> {
+pub(crate) fn folder_arg(command: &str, s: &Session, args: &Value) -> Result<PathBuf, EngineError> {
     match args.get("path") {
         Some(_) => arg_str(command, args, "path").map(PathBuf::from),
         None => current_folder(s).ok_or_else(|| EngineError::InvalidArgument {
@@ -138,6 +142,7 @@ fn step(s: &mut Session, delta: isize) {
 }
 
 fn select_only(s: &mut Session, id: ModelId) {
+    s.focused_folder = None;
     s.current = Some(id);
     s.anchor = Some(id);
     s.selection.clear();
@@ -160,6 +165,7 @@ fn select_model(s: &mut Session, args: &Value) -> Result<(), EngineError> {
             reason: format!("model {id} is not shown"),
         });
     }
+    s.focused_folder = None;
     match args
         .get("mode")
         .and_then(Value::as_str)
@@ -294,7 +300,6 @@ pub fn register(r: &mut CommandRegistry) {
         run: |s, _| {
             if let Some(parent) = parent_folder(s) {
                 s.collection = Collection::Folder(parent);
-                s.view = crate::ViewMode::Grid;
             }
             Ok(())
         },
@@ -428,14 +433,7 @@ pub fn register(r: &mut CommandRegistry) {
         has_models,
         |s| {
             let cols = s.grid_columns.max(1) as isize;
-            step(
-                s,
-                if s.view == crate::ViewMode::Grid {
-                    cols
-                } else {
-                    1
-                },
-            )
+            step(s, cols)
         }
     );
     simple!(
@@ -447,14 +445,7 @@ pub fn register(r: &mut CommandRegistry) {
         has_models,
         |s| {
             let cols = s.grid_columns.max(1) as isize;
-            step(
-                s,
-                if s.view == crate::ViewMode::Grid {
-                    -cols
-                } else {
-                    -1
-                },
-            )
+            step(s, -cols)
         }
     );
     simple!(
@@ -465,6 +456,7 @@ pub fn register(r: &mut CommandRegistry) {
         Some(Shortcut::ctrl(Key::Char('a'))),
         has_models,
         |s| {
+            s.focused_folder = None;
             s.selection = s.visible().iter().copied().collect();
             if s.current.is_none() {
                 s.current = s.visible().first().copied();
@@ -732,7 +724,7 @@ mod tests {
             session_with_files(&["wolf.stl", "wolf.png", "boat.stl", "other.jpg", "kit.zip"]);
         assert_eq!(
             visible_names(&s),
-            ["wolf.stl", "boat.stl", "other.jpg", "kit.zip"]
+            ["boat.stl", "kit.zip", "other.jpg", "wolf.stl"]
         );
         let (wolf, photo) = (id_of(&s, "wolf.stl"), id_of(&s, "wolf.png"));
         assert_eq!(s.stack(wolf), [photo]);
@@ -743,7 +735,7 @@ mod tests {
         r.run("filter.format", &mut s, &json!({"format": "image"}))
             .unwrap();
         s.poll();
-        assert_eq!(visible_names(&s), ["wolf.png", "other.jpg"]);
+        assert_eq!(visible_names(&s), ["other.jpg", "wolf.png"]);
         r.run("filter.clear", &mut s, &json!(null)).unwrap();
 
         r.run("view.toggle_photo_covers", &mut s, &json!(null))
@@ -765,7 +757,6 @@ mod tests {
         assert!(!r.is_enabled("loupe.next_photo", &s), "boat has no photos");
 
         r.run("select.model", &mut s, &json!({"id": wolf})).unwrap();
-        r.run("view.loupe", &mut s, &json!(null)).unwrap();
         s.poll();
         assert!(!r.is_enabled("loupe.show_3d", &s));
         let mut shown = Vec::new();

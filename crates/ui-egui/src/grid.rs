@@ -1,4 +1,4 @@
-//! The thumbnail grid and the filmstrip.
+//! The thumbnail grid.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::layout::Actions;
 use crate::thumbs::ThumbTextures;
-use crate::{icons, theme};
+use crate::{icons, meta_ui, theme};
 
 const GAP: f32 = 8.0;
 /// Space under the thumbnail for the name and stars.
@@ -35,14 +35,63 @@ fn select_mode(modifiers: Modifiers) -> &'static str {
     }
 }
 
-/// Handles clicks on a model cell; double-click opens the loupe.
-fn cell_clicks(ui: &Ui, response: &egui::Response, id: ModelId, actions: &mut Actions) {
+/// Handles clicks on a model cell: a click selects, a double-click opens the file, and a
+/// right-click selects the cell first unless it is part of the selection already.
+fn cell_clicks(
+    ui: &Ui,
+    response: &egui::Response,
+    id: ModelId,
+    selected: bool,
+    actions: &mut Actions,
+) {
     if response.double_clicked() {
         actions.push_args("select.model", json!({ "id": id }));
-        actions.push("view.loupe");
+        actions.push("file.open");
     } else if response.clicked() {
         let mode = select_mode(ui.input(|i| i.modifiers));
         actions.push_args("select.model", json!({ "id": id, "mode": mode }));
+    } else if response.secondary_clicked() && !selected {
+        actions.push_args("select.model", json!({ "id": id }));
+    }
+}
+
+/// The right-click menu of a model cell. It acts on the selection.
+fn model_menu(ui: &mut Ui, session: &Session, id: ModelId, actions: &mut Actions) {
+    let Some(model) = session.model(id) else {
+        return;
+    };
+    if ui.button("Open").clicked() {
+        actions.push("file.open");
+    }
+    if ui.button("Reveal in File Explorer").clicked() {
+        actions.push("file.reveal");
+    }
+    ui.separator();
+    let favorite = if model.meta.favorite {
+        "Remove from Favorites"
+    } else {
+        "Add to Favorites"
+    };
+    if ui.button(favorite).clicked() {
+        actions.push("meta.favorite.toggle");
+    }
+    ui.menu_button("Category", |ui| {
+        meta_ui::category_items(ui, session, model.meta.category, None, actions);
+    });
+    ui.menu_button("Add Tag", |ui| {
+        ui.set_min_width(180.0);
+        let key = ui.make_persistent_id("cell-menu-tag");
+        let mut text: String = ui.data_mut(|d| d.get_temp(key)).unwrap_or_default();
+        meta_ui::add_tag_box(ui, &mut text, None, actions);
+        ui.data_mut(|d| d.insert_temp(key, text));
+    });
+    if ui.button("Regenerate Thumbnail").clicked() {
+        actions.push("preview.regenerate");
+    }
+    ui.separator();
+    let delete = egui::RichText::new("Delete…").color(Color32::from_rgb(0xe0, 0x60, 0x60));
+    if ui.button(delete).clicked() {
+        actions.push("file.delete");
     }
 }
 
@@ -185,7 +234,10 @@ fn folder_cell(
     }
     if response.double_clicked() {
         actions.push_args("library.show_folder", json!({ "path": path }));
+    } else if response.clicked() || response.secondary_clicked() {
+        actions.push_args("select.folder", json!({ "path": path }));
     }
+    let focused = session.focused_folder() == Some(path);
     let Some(node) = session.folder(path).cloned() else {
         return;
     };
@@ -196,8 +248,16 @@ fn folder_cell(
     painter.rect_filled(
         rect,
         CornerRadius::same(3),
-        cell_fill(false, response.hovered()),
+        cell_fill(focused, response.hovered()),
     );
+    if focused {
+        painter.rect_stroke(
+            rect.shrink(0.5),
+            CornerRadius::same(3),
+            Stroke::new(1.5, theme::ACCENT),
+            StrokeKind::Inside,
+        );
+    }
 
     // Folder shape: a back panel with a tab, and a front panel.
     let pad = 10.0;
@@ -247,7 +307,7 @@ fn folder_cell(
         FontId::proportional(11.0),
         theme::TEXT_DIM,
     );
-    response.context_menu(|ui| crate::tree::folder_menu(ui, path, actions));
+    response.context_menu(|ui| crate::tree::folder_menu(ui, path, session, actions));
     // "⋯" in the top-right corner, also opening the folder menu.
     let dots = Rect::from_min_size(
         pos2(rect.right() - 30.0, rect.top() + 4.0),
@@ -255,7 +315,7 @@ fn folder_cell(
     );
     let hovered = ui.rect_contains_pointer(rect);
     let dots_id = ui.make_persistent_id(("cell-dots", path));
-    crate::tree::dots_button(ui, dots, dots_id, path, hovered, actions);
+    crate::tree::dots_button(ui, dots, dots_id, path, hovered, session, actions);
     response.on_hover_text(format!("{}\nDouble-click to open", node.path.display()));
 }
 
@@ -271,12 +331,13 @@ fn grid_cell(
     if !ui.is_rect_visible(rect) {
         return;
     }
-    cell_clicks(ui, &response, id, actions);
+    let selected = session.is_selected(id);
+    cell_clicks(ui, &response, id, selected, actions);
     let Some(model) = session.model(id).cloned() else {
         return;
     };
+    response.context_menu(|ui| model_menu(ui, session, id, actions));
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, model.name()));
-    let selected = session.is_selected(id);
     let current = session.current() == Some(id);
     let painter = ui.painter_at(rect);
 
@@ -314,6 +375,13 @@ fn grid_cell(
         Flag::None => {}
     }
 
+    // Favorite heart, top-right.
+    if model.meta.favorite {
+        let heart = Rect::from_min_size(pair_top_right(img, vec2(18.0, 16.0)), vec2(14.0, 13.0));
+        icons::heart(&painter, heart.expand(1.0), Color32::from_black_alpha(160));
+        icons::heart(&painter, heart, icons::HEART);
+    }
+
     // Name and stars.
     let name_pos = pos2(rect.left() + pad, rect.top() + rect.width() - 2.0);
     let name = model.name();
@@ -333,6 +401,8 @@ fn grid_cell(
         );
     }
 
+    category_pill(&painter, rect, session, &model);
+
     // Colour label: a strip along the bottom edge.
     if let Some(label) = model.label {
         let strip = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), rect.max);
@@ -349,6 +419,46 @@ fn grid_cell(
     } else {
         response.on_hover_text(model.path.display().to_string());
     }
+}
+
+/// Where a `size` box goes in the top-right corner of `rect`, inset by 6.
+fn pair_top_right(rect: Rect, size: egui::Vec2) -> egui::Pos2 {
+    pos2(rect.right() - size.x + 4.0, rect.top() + 6.0)
+}
+
+/// The model's category (its own or its folder's) as a small pill at the bottom right.
+fn category_pill(
+    painter: &egui::Painter,
+    cell: Rect,
+    session: &Session,
+    model: &polyroom_engine::Model,
+) {
+    let Some(id) = session.catalog().effective_category(model) else {
+        return;
+    };
+    let Some(category) = session.catalog().categories().iter().find(|c| c.id == id) else {
+        return;
+    };
+    let galley = painter.layout_no_wrap(
+        category.name.clone(),
+        FontId::proportional(10.0),
+        Color32::WHITE,
+    );
+    let width = (galley.size().x + 10.0).min(cell.width() * 0.55);
+    let pill = Rect::from_min_size(
+        pos2(cell.right() - width - 6.0, cell.bottom() - 20.0),
+        vec2(width, 15.0),
+    );
+    painter.rect_filled(
+        pill,
+        CornerRadius::same(7),
+        meta_ui::category_color(category),
+    );
+    painter.with_clip_rect(pill.shrink2(vec2(3.0, 0.0))).galley(
+        pos2(pill.left() + 5.0, pill.center().y - galley.size().y / 2.0),
+        galley,
+        Color32::WHITE,
+    );
 }
 
 /// A pill in the bottom-right corner of `img`: the photo count of a stacked model, or "ZIP".
@@ -375,81 +485,12 @@ fn kind_badge(painter: &egui::Painter, img: Rect, format: Format, photos: usize)
     painter.galley(pos, galley, Color32::WHITE);
 }
 
-/// A horizontal strip of small thumbnails along the bottom, like Lightroom's filmstrip.
-pub fn filmstrip(
-    ui: &mut Ui,
-    session: &mut Session,
-    thumbs: &mut ThumbTextures,
-    state: &mut GridState,
-    actions: &mut Actions,
-) {
-    let ids: Vec<ModelId> = session.visible().to_vec();
-    let h = ui.available_height();
-    let size = vec2(h, h);
-    let step = size.x + 4.0;
-
-    let mut area = egui::ScrollArea::horizontal()
-        .auto_shrink([false, false])
-        .id_salt("filmstrip");
-    if session.current() != state.last_current && state.viewport_height > 0.0 {
-        state.last_current = session.current();
-        if let Some(pos) = session
-            .current()
-            .and_then(|c| ids.iter().position(|&i| i == c))
-        {
-            let left = pos as f32 * step;
-            if left < state.offset || left + step > state.offset + state.viewport_height {
-                area = area.horizontal_scroll_offset((left - state.viewport_height / 2.0).max(0.0));
-            }
-        }
-    }
-    let output = area.show_viewport(ui, |ui, viewport| {
-        ui.set_min_size(vec2(ids.len() as f32 * step, h));
-        let origin = ui.min_rect().min;
-        let first = (viewport.min.x / step).floor().max(0.0) as usize;
-        let count = (viewport.width() / step).ceil() as usize + 1;
-        for (i, &id) in ids.iter().enumerate().skip(first).take(count) {
-            let rect = Rect::from_min_size(origin + vec2(i as f32 * step, 0.0), size);
-            let response = ui.interact(rect, ui.scope_id().with(("film", id)), Sense::click());
-            cell_clicks(ui, &response, id, actions);
-            if let Some(model) = session.model(id) {
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::Role::Button, true, model.name())
-                });
-            }
-            let selected = session.is_selected(id);
-            ui.painter().rect_filled(
-                rect,
-                CornerRadius::same(2),
-                cell_fill(selected, response.hovered()),
-            );
-            thumbnail(ui, rect.shrink(4.0), id, session, thumbs);
-            if session.current() == Some(id) {
-                ui.painter().rect_stroke(
-                    rect,
-                    CornerRadius::same(2),
-                    Stroke::new(1.5, theme::ACCENT),
-                    StrokeKind::Inside,
-                );
-            }
-            if let Some(label) = session.model(id).and_then(|m| m.label) {
-                let strip = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), rect.max);
-                ui.painter()
-                    .rect_filled(strip, CornerRadius::ZERO, icons::label_color(label));
-            }
-        }
-    });
-    state.offset = output.state.clamped_offset().x;
-    // For the horizontal strip, "viewport_height" holds the visible width.
-    state.viewport_height = output.inner_rect.width();
-}
-
 #[cfg(test)]
 mod tests {
     use egui::accesskit::Role;
     use egui_kittest::Harness;
     use egui_kittest::kittest::{NodeT, Queryable};
-    use polyroom_engine::{CommandRegistry, ViewMode, default_registry};
+    use polyroom_engine::{CommandRegistry, Request, default_registry};
 
     use super::*;
     use crate::test_support::imported;
@@ -459,7 +500,6 @@ mod tests {
         registry: CommandRegistry,
         thumbs: ThumbTextures,
         grid: GridState,
-        film: GridState,
     }
 
     impl App {
@@ -490,7 +530,6 @@ mod tests {
             registry: default_registry(),
             thumbs: ThumbTextures::default(),
             grid: GridState::default(),
-            film: GridState::default(),
         }
     }
 
@@ -508,27 +547,6 @@ mod tests {
                         &mut app.session,
                         &mut app.thumbs,
                         &mut app.grid,
-                        &mut actions,
-                    );
-                    app.run(actions);
-                },
-                app(session),
-            )
-    }
-
-    fn filmstrip_harness(session: Session) -> Harness<'static, App> {
-        Harness::builder()
-            .with_size(vec2(700.0, 96.0))
-            .build_ui_state(
-                |ui, app: &mut App| {
-                    crate::theme::apply(ui.ctx());
-                    app.session.poll();
-                    let mut actions = Actions::default();
-                    filmstrip(
-                        ui,
-                        &mut app.session,
-                        &mut app.thumbs,
-                        &mut app.film,
                         &mut actions,
                     );
                     app.run(actions);
@@ -623,23 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_filmstrip_cell_selects_that_model() {
-        let (_dir, mut session) = imported(&files());
-        let root = session.catalog().folders()[0].clone();
-        default_registry()
-            .run(
-                "library.show_folder",
-                &mut session,
-                &serde_json::json!({ "path": root }),
-            )
-            .unwrap();
-        session.poll();
-        let mut harness = filmstrip_harness(session);
-        click_every_cell(&mut harness, 30);
-    }
-
-    #[test]
-    fn double_clicking_opens_that_model_in_the_loupe() {
+    fn double_clicking_opens_that_file() {
         // One cell in the first row, and the last one, which sits in a partly visible row.
         for last in [false, true] {
             let (_dir, session) = imported(&files());
@@ -655,15 +657,80 @@ mod tests {
             }
             .unwrap();
             click_cell(&mut harness, &target, 2, Modifiers::NONE);
-            let app = harness.state();
-            assert_eq!(app.session.view, ViewMode::Loupe, "double-clicked {target}");
+            let app = harness.state_mut();
             assert_eq!(app.current_name().as_deref(), Some(target.as_str()));
+            let opened: Vec<String> = app
+                .session
+                .drain_requests()
+                .into_iter()
+                .filter_map(|r| match r {
+                    Request::OpenFile(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(
-                app.session.loupe().id,
-                app.session.current(),
-                "the loupe loads the clicked model"
+                opened,
+                std::slice::from_ref(&target),
+                "double-clicked {target}"
             );
         }
+    }
+
+    /// Right-clicks the cell labelled `label`.
+    fn right_click_cell(harness: &mut Harness<'_, App>, label: &str) {
+        let rect = harness.get_by_label(label).rect();
+        let pos = rect.intersect(screen(harness)).center();
+        harness.event(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+        }
+        harness.run_steps(5);
+    }
+
+    #[test]
+    fn right_clicking_a_model_selects_it_and_offers_reveal_and_delete() {
+        let (_dir, session) = imported(&files());
+        let mut harness = grid_harness(session);
+        harness.run();
+        let target = visible_cells(&harness)
+            .into_iter()
+            .find(|l| !l.ends_with(" folder") && l != "m00.stl")
+            .unwrap();
+        right_click_cell(&mut harness, &target);
+        assert_eq!(
+            harness.state().current_name().as_deref(),
+            Some(target.as_str())
+        );
+        harness.get_by_label("Reveal in File Explorer");
+        harness.get_by_label_contains("Delete");
+        harness.get_by_label("Add to Favorites");
+
+        harness.get_by_label("Reveal in File Explorer").click();
+        harness.run_steps(3);
+        let requests = harness.state_mut().session.drain_requests();
+        assert!(
+            matches!(requests.as_slice(), [Request::RevealFile(p)] if p.ends_with(&target)),
+            "{requests:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_cell_is_focused_by_a_click_and_has_a_context_menu() {
+        let (_dir, session) = imported(&files());
+        let mut harness = grid_harness(session);
+        harness.run();
+        click_cell(&mut harness, "extra folder", 1, Modifiers::NONE);
+        assert!(harness.state().session.focused_folder().is_some());
+
+        right_click_cell(&mut harness, "extra folder");
+        harness.get_by_label("Remove from Library…");
+        harness.get_by_label("Reveal in File Explorer");
+        harness.get_by_label("Add to Favorites");
     }
 
     #[test]

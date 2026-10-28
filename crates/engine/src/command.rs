@@ -17,6 +17,7 @@ pub enum Key {
     Plus,
     Minus,
     F5,
+    Delete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,6 +78,7 @@ impl Shortcut {
             Key::Plus => out.push('+'),
             Key::Minus => out.push('-'),
             Key::F5 => out.push_str("F5"),
+            Key::Delete => out.push_str("Delete"),
         }
         out
     }
