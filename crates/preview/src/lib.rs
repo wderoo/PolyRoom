@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod cache;
+mod picture;
 
 use std::collections::{HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -15,6 +16,8 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
+use polyroom_formats::Format;
+use polyroom_formats::archive::{self, ArchiveEntry};
 use polyroom_mesh::{Mesh, MeshStats};
 use polyroom_render::{Headless, Image};
 
@@ -22,6 +25,12 @@ pub use cache::{decode_png, encode_png};
 
 /// Thumbnail edge length in pixels.
 pub const THUMB_PX: u32 = 256;
+/// Largest image inside a ZIP we decode for its cover.
+const MAX_ZIP_IMAGE: u64 = 64 << 20;
+/// Largest model inside a ZIP we render for its cover.
+const MAX_ZIP_MESH: u64 = 256 << 20;
+/// Models inside a ZIP tried for its cover before giving up.
+const ZIP_MESH_TRIES: usize = 3;
 /// Bump to invalidate cached thumbnails after changing how they look.
 const RENDER_VERSION: u32 = 2;
 
@@ -59,6 +68,16 @@ pub enum Event {
         id: JobId,
         mesh: Arc<Mesh>,
     },
+    /// A preview image at loupe size.
+    Picture {
+        id: JobId,
+        image: Arc<Image>,
+    },
+    /// The files inside a ZIP archive.
+    Archive {
+        id: JobId,
+        entries: Vec<ArchiveEntry>,
+    },
     /// Loading or rendering failed; `error` is shown to the user. `bad_file` is false when the
     /// file itself is fine (e.g. no GPU for thumbnails).
     Failed {
@@ -80,6 +99,15 @@ enum Job {
         id: JobId,
         source: Source,
     },
+    Picture {
+        id: JobId,
+        source: Source,
+        max_px: u32,
+    },
+    Archive {
+        id: JobId,
+        source: Source,
+    },
 }
 
 #[derive(Default)]
@@ -95,6 +123,8 @@ pub struct PreviewService {
     events: Receiver<Event>,
     pending_thumbs: HashSet<JobId>,
     pending_mesh: Option<JobId>,
+    /// A picture or archive listing for the loupe.
+    pending_detail: Option<JobId>,
 }
 
 impl PreviewService {
@@ -132,6 +162,7 @@ impl PreviewService {
             events,
             pending_thumbs: HashSet::new(),
             pending_mesh: None,
+            pending_detail: None,
         }
     }
 
@@ -174,6 +205,31 @@ impl PreviewService {
         self.push(Job::Mesh { id, source }, true);
     }
 
+    /// Queues a loupe-sized picture of an image file, ahead of thumbnails, replacing any
+    /// queued picture or archive listing.
+    pub fn request_picture(&mut self, id: JobId, source: Source, max_px: u32) {
+        self.request_detail(id, Job::Picture { id, source, max_px });
+    }
+
+    /// Queues listing the files of a ZIP archive, like [`PreviewService::request_picture`].
+    pub fn request_archive(&mut self, id: JobId, source: Source) {
+        self.request_detail(id, Job::Archive { id, source });
+    }
+
+    fn request_detail(&mut self, id: JobId, job: Job) {
+        if self.pending_detail == Some(id) {
+            return;
+        }
+        {
+            let (lock, _) = &*self.queue;
+            let mut q = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            q.jobs
+                .retain(|j| !matches!(j, Job::Picture { .. } | Job::Archive { .. }));
+        }
+        self.pending_detail = Some(id);
+        self.push(job, true);
+    }
+
     /// Drops queued thumbnail jobs that haven't started (e.g. after scrolling far away).
     pub fn clear_queued_thumbnails(&mut self) {
         let (lock, _) = &*self.queue;
@@ -197,7 +253,9 @@ impl PreviewService {
     }
 
     pub fn is_busy(&self) -> bool {
-        !self.pending_thumbs.is_empty() || self.pending_mesh.is_some()
+        !self.pending_thumbs.is_empty()
+            || self.pending_mesh.is_some()
+            || self.pending_detail.is_some()
     }
 
     /// Takes all finished results.
@@ -213,10 +271,18 @@ impl PreviewService {
                         self.pending_mesh = None;
                     }
                 }
+                Event::Picture { id, .. } | Event::Archive { id, .. } => {
+                    if self.pending_detail == Some(*id) {
+                        self.pending_detail = None;
+                    }
+                }
                 Event::Failed { id, .. } => {
                     self.pending_thumbs.remove(id);
                     if self.pending_mesh == Some(*id) {
                         self.pending_mesh = None;
+                    }
+                    if self.pending_detail == Some(*id) {
+                        self.pending_detail = None;
                     }
                 }
                 Event::Stats { .. } => {}
@@ -267,6 +333,32 @@ fn worker(
                     bad_file: true,
                 }),
             },
+            Job::Picture { id, source, max_px } => {
+                let picture = std::fs::read(&source.path)
+                    .map_err(|e| format!("could not read file: {e}"))
+                    .and_then(|bytes| guarded(|| picture::fit(&bytes, max_px)));
+                match picture {
+                    Ok(image) => events.send(Event::Picture {
+                        id,
+                        image: Arc::new(image),
+                    }),
+                    Err(error) => events.send(Event::Failed {
+                        id,
+                        error,
+                        bad_file: true,
+                    }),
+                }
+            }
+            Job::Archive { id, source } => {
+                match guarded(|| archive::list(&source.path).map_err(|e| e.to_string())) {
+                    Ok(entries) => events.send(Event::Archive { id, entries }),
+                    Err(error) => events.send(Event::Failed {
+                        id,
+                        error,
+                        bad_file: true,
+                    }),
+                }
+            }
             Job::Thumbnail {
                 id,
                 source,
@@ -274,11 +366,60 @@ fn worker(
             } => {
                 let cache_path = cache_dir.join(format!("{}.png", source.cache_key()));
                 let cached = std::fs::read(&cache_path).ok().and_then(|b| decode_png(&b));
+                let format = Format::from_path(&source.path);
                 if let (Some(image), false) = (&cached, need_stats) {
                     events.send(Event::Thumbnail {
                         id,
                         image: image.clone(),
                     })
+                } else if format == Some(Format::Image) {
+                    let thumb = std::fs::read(&source.path)
+                        .map_err(|e| format!("could not read file: {e}"))
+                        .and_then(|bytes| guarded(|| picture::thumbnail(&bytes, THUMB_PX)));
+                    match thumb {
+                        Ok(image) => {
+                            write_cache(&cache_path, &image);
+                            events.send(Event::Thumbnail { id, image })
+                        }
+                        Err(error) => events.send(Event::Failed {
+                            id,
+                            error,
+                            bad_file: true,
+                        }),
+                    }
+                } else if format == Some(Format::Zip) {
+                    match guarded(|| zip_cover(&source.path)) {
+                        Ok(Cover::Image(image)) => {
+                            write_cache(&cache_path, &image);
+                            events.send(Event::Thumbnail { id, image })
+                        }
+                        Ok(Cover::Mesh(mesh)) => {
+                            if render.send((id, mesh, cache_path)).is_err() {
+                                let _ = events.send(Event::Failed {
+                                    id,
+                                    error: "thumbnail renderer is not running".into(),
+                                    bad_file: false,
+                                });
+                            }
+                            Ok(())
+                        }
+                        Ok(Cover::NotDownloaded) => events.send(Event::Failed {
+                            id,
+                            error: "this ZIP is online-only; download it to see a preview".into(),
+                            bad_file: false,
+                        }),
+                        // The archive is fine, it just holds nothing to show.
+                        Ok(Cover::Nothing) => events.send(Event::Failed {
+                            id,
+                            error: "nothing to preview in this archive".into(),
+                            bad_file: false,
+                        }),
+                        Err(error) => events.send(Event::Failed {
+                            id,
+                            error,
+                            bad_file: true,
+                        }),
+                    }
                 } else {
                     match load_guarded(&source.path) {
                         Ok(mesh) => {
@@ -325,6 +466,86 @@ fn load_guarded(path: &Path) -> Result<Mesh, String> {
     guarded(|| polyroom_formats::load(path).map_err(|e| e.to_string()))
 }
 
+/// What a ZIP's grid cell shows.
+enum Cover {
+    Image(Image),
+    /// A model inside, to be rendered.
+    Mesh(Mesh),
+    /// Only a cloud placeholder is on disk; reading it would download the whole archive.
+    NotDownloaded,
+    Nothing,
+}
+
+/// Windows attributes of a cloud file (OneDrive "online-only") whose data isn't on disk:
+/// `FILE_ATTRIBUTE_OFFLINE`, `FILE_ATTRIBUTE_RECALL_ON_OPEN`, `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`.
+const ONLINE_ONLY_ATTRIBUTES: u32 = 0x1000 | 0x4_0000 | 0x40_0000;
+
+fn is_online_only_attributes(attributes: u32) -> bool {
+    attributes & ONLINE_ONLY_ATTRIBUTES != 0
+}
+
+/// Whether `path` is a cloud placeholder that reading would first download.
+fn is_online_only(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        std::fs::metadata(path).is_ok_and(|m| is_online_only_attributes(m.file_attributes()))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Picks a ZIP's cover: the first image inside, else the first model inside that loads.
+/// Only an unreadable archive is an error; bad files inside it are skipped.
+fn zip_cover(path: &Path) -> Result<Cover, String> {
+    if is_online_only(path) {
+        return Ok(Cover::NotDownloaded);
+    }
+    let entries = archive::list(path).map_err(|e| e.to_string())?;
+    let read = |e: &ArchiveEntry, max: u64| archive::read_entry(path, &e.name, max).ok();
+    for e in entries
+        .iter()
+        .filter(|e| e.format == Some(Format::Image) && e.size <= MAX_ZIP_IMAGE)
+    {
+        if let Some(image) =
+            read(e, MAX_ZIP_IMAGE).and_then(|b| picture::thumbnail(&b, THUMB_PX).ok())
+        {
+            return Ok(Cover::Image(image));
+        }
+    }
+    for e in entries
+        .iter()
+        .filter(|e| e.format.is_some_and(Format::is_mesh) && e.size <= MAX_ZIP_MESH)
+        .take(ZIP_MESH_TRIES)
+    {
+        let mesh = e
+            .format
+            .zip(read(e, MAX_ZIP_MESH))
+            .and_then(|(format, bytes)| polyroom_formats::load_bytes(format, &bytes).ok());
+        if let Some(mesh) = mesh {
+            return Ok(Cover::Mesh(mesh));
+        }
+    }
+    Ok(Cover::Nothing)
+}
+
+fn write_cache(cache_path: &Path, image: &Image) {
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match encode_png(image) {
+        Some(png) => {
+            if let Err(e) = std::fs::write(cache_path, png) {
+                log::warn!("could not cache thumbnail {}: {e}", cache_path.display());
+            }
+        }
+        None => log::warn!("could not encode thumbnail"),
+    }
+}
+
 fn gpu_thread(jobs: &Receiver<(JobId, Mesh, PathBuf)>, events: &Sender<Event>) {
     let gpu = match Headless::new() {
         Ok(gpu) => Some(gpu),
@@ -341,17 +562,7 @@ fn gpu_thread(jobs: &Receiver<(JobId, Mesh, PathBuf)>, events: &Sender<Event>) {
         drop(mesh);
         let event = match result {
             Ok(image) => {
-                if let Some(parent) = cache_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                match encode_png(&image) {
-                    Some(png) => {
-                        if let Err(e) = std::fs::write(&cache_path, png) {
-                            log::warn!("could not cache thumbnail {}: {e}", cache_path.display());
-                        }
-                    }
-                    None => log::warn!("could not encode thumbnail"),
-                }
+                write_cache(&cache_path, &image);
                 Event::Thumbnail { id, image }
             }
             Err(error) => Event::Failed {
@@ -440,5 +651,110 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, Event::Stats { id: 9, stats } if (stats.volume - 1000.0).abs() < 1e-3)
         ));
+    }
+
+    fn zip_with(path: &Path, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, data) in files {
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn red_png(w: u32, h: u32) -> Vec<u8> {
+        encode_png(&Image {
+            width: w,
+            height: h,
+            rgba: [255, 0, 0, 255].repeat((w * h) as usize),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn online_only_cloud_files_are_recognised() {
+        // An online-only OneDrive file reports RECALL_ON_DATA_ACCESS (plus ARCHIVE, 0x20).
+        assert!(is_online_only_attributes(0x40_0020));
+        assert!(is_online_only_attributes(0x1000));
+        // "Always keep on this device" / locally available files don't.
+        assert!(!is_online_only_attributes(0x20));
+        assert!(!is_online_only_attributes(0x8_0020)); // PINNED
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local.zip");
+        std::fs::write(&local, b"x").unwrap();
+        assert!(!is_online_only(&local));
+    }
+
+    #[test]
+    fn images_and_archives_get_thumbnails_pictures_and_listings() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("photo.png");
+        std::fs::write(&photo, red_png(300, 200)).unwrap();
+        let with_image = dir.path().join("with image.zip");
+        zip_with(
+            &with_image,
+            &[("README.txt", b"hi"), ("images/a.png", &red_png(8, 8))],
+        );
+        let empty = dir.path().join("only text.zip");
+        zip_with(&empty, &[("README.txt", b"hi")]);
+        let broken = dir.path().join("broken.zip");
+        std::fs::write(&broken, b"not a zip").unwrap();
+
+        let mut s = PreviewService::start(dir.path().join("cache"));
+        let source = |p: &Path| Source {
+            path: p.to_owned(),
+            size: 1,
+            modified: None,
+        };
+        let finished = |id: JobId| move |e: &Event| matches!(e, Event::Thumbnail { id: i, .. } | Event::Failed { id: i, .. } if *i == id);
+
+        s.request_thumbnail(1, source(&photo), false);
+        let events = wait_for(&mut s, finished(1));
+        assert!(
+            matches!(events.last(), Some(Event::Thumbnail { image, .. }) if image.width == THUMB_PX && image.height == THUMB_PX),
+            "{events:?}"
+        );
+
+        s.request_thumbnail(2, source(&with_image), false);
+        let events = wait_for(&mut s, finished(2));
+        assert!(
+            matches!(events.last(), Some(Event::Thumbnail { .. })),
+            "{events:?}"
+        );
+
+        s.request_thumbnail(3, source(&empty), false);
+        let events = wait_for(&mut s, finished(3));
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::Failed {
+                    bad_file: false,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+
+        s.request_thumbnail(4, source(&broken), false);
+        let events = wait_for(&mut s, finished(4));
+        assert!(
+            matches!(events.last(), Some(Event::Failed { bad_file: true, .. })),
+            "{events:?}"
+        );
+
+        s.request_picture(5, source(&photo), 150);
+        let events = wait_for(&mut s, |e| matches!(e, Event::Picture { id: 5, .. }));
+        assert!(
+            matches!(events.last(), Some(Event::Picture { image, .. }) if (image.width, image.height) == (150, 100))
+        );
+
+        s.request_archive(6, source(&with_image));
+        let events = wait_for(&mut s, |e| matches!(e, Event::Archive { id: 6, .. }));
+        assert!(
+            matches!(events.last(), Some(Event::Archive { entries, .. }) if entries.len() == 2)
+        );
+        assert!(!s.is_busy());
     }
 }

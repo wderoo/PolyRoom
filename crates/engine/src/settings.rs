@@ -19,6 +19,7 @@ pub(crate) const DEFAULT_THUMB_SIZE: f32 = 192.0;
 pub(crate) struct Settings {
     pub thumb_size: f32,
     pub show_bed_grid: bool,
+    pub photo_covers: bool,
     pub panels: Panels,
     pub view: ViewMode,
     pub module: Module,
@@ -30,6 +31,7 @@ impl Default for Settings {
         Self {
             thumb_size: DEFAULT_THUMB_SIZE,
             show_bed_grid: true,
+            photo_covers: true,
             panels: Panels::default(),
             view: ViewMode::default(),
             module: Module::default(),
@@ -76,6 +78,7 @@ mod tests {
         let settings = Settings {
             thumb_size: 256.0,
             show_bed_grid: false,
+            photo_covers: false,
             panels: Panels {
                 left: false,
                 right: true,
@@ -103,6 +106,10 @@ mod tests {
         let partial = load(&path);
         assert_eq!(partial.thumb_size, 300.0);
         assert!(partial.show_bed_grid, "the grid is on unless turned off");
+        assert!(
+            partial.photo_covers,
+            "photo covers are on unless turned off"
+        );
         assert_eq!(partial.panels, Panels::default());
         assert_eq!(partial.view, ViewMode::Grid);
     }

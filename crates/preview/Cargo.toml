@@ -11,9 +11,11 @@ polyroom-mesh.workspace = true
 polyroom-formats.workspace = true
 polyroom-render.workspace = true
 png.workspace = true
+image.workspace = true
 log.workspace = true
 
 [dev-dependencies]
+zip.workspace = true
 tempfile.workspace = true
 
 [lints]

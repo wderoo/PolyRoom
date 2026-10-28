@@ -64,6 +64,36 @@ fn has_models(s: &Session) -> bool {
     !s.visible().is_empty()
 }
 
+fn has_stack(s: &Session) -> bool {
+    s.current.is_some_and(|id| !s.stack(id).is_empty())
+}
+
+/// Shows `photo` (a photo from the current model's stack) in the loupe, or the 3D view for
+/// `None`.
+fn show_photo(s: &mut Session, photo: Option<ModelId>) {
+    // Make sure the loupe holds the current model, so the choice isn't reset right after.
+    s.update_loupe();
+    s.loupe.photo = photo;
+    s.update_loupe();
+}
+
+/// Steps through the stack's photos, then back to the 3D view.
+fn next_photo(s: &mut Session) {
+    let Some(current) = s.current else {
+        return;
+    };
+    let stack = s.stack(current);
+    let next = match s
+        .loupe
+        .photo
+        .and_then(|p| stack.iter().position(|&i| i == p))
+    {
+        Some(i) => stack.get(i + 1).copied(),
+        None => stack.first().copied(),
+    };
+    show_photo(s, next);
+}
+
 fn rate(s: &mut Session, rating: u8) {
     for id in s.targets() {
         s.apply(Op::SetRating { id, rating });
@@ -454,6 +484,51 @@ pub fn register(r: &mut CommandRegistry) {
         }
     );
 
+    // Photos stacked on a model, shown in the loupe.
+    r.register(Command {
+        id: "loupe.show_photo",
+        label: "Show Photo",
+        menu: "",
+        shortcut: None,
+        enabled: has_stack,
+        run: |s, args| {
+            const ID: &str = "loupe.show_photo";
+            let id = args.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                EngineError::InvalidArgument {
+                    command: ID.into(),
+                    reason: "expected {\"id\": number}".into(),
+                }
+            })?;
+            let in_stack = s.current.is_some_and(|c| s.stack(c).contains(&id));
+            if !in_stack {
+                return Err(EngineError::InvalidArgument {
+                    command: ID.into(),
+                    reason: format!("{id} is not a photo of the current model"),
+                });
+            }
+            show_photo(s, Some(id));
+            Ok(())
+        },
+    });
+    simple!(
+        r,
+        "loupe.next_photo",
+        "Next Photo",
+        "View/Loupe/Next Photo",
+        None,
+        has_stack,
+        |s| next_photo(s)
+    );
+    simple!(
+        r,
+        "loupe.show_3d",
+        "Show 3D Model",
+        "View/Loupe/Show 3D Model",
+        None,
+        |s| s.loupe.photo.is_some(),
+        |s| show_photo(s, None)
+    );
+
     // Ratings.
     simple!(
         r,
@@ -611,6 +686,111 @@ mod tests {
         s.catalog.import(Path::new("C:/m"), files).unwrap();
         s.poll();
         s
+    }
+
+    /// Like `session_with`, but each file gets the format its extension says.
+    fn session_with_files(names: &[&str]) -> Session {
+        let mut s = Session::new();
+        let files = names
+            .iter()
+            .map(|n| {
+                let path = Path::new("C:/m").join(n);
+                ScannedFile {
+                    format: Format::from_path(&path).unwrap(),
+                    path,
+                    size: 1,
+                    modified: None,
+                }
+            })
+            .collect();
+        s.catalog.import(Path::new("C:/m"), files).unwrap();
+        s.collection = Collection::Folder("C:/m".into());
+        s.poll();
+        s
+    }
+
+    fn visible_names(s: &Session) -> Vec<String> {
+        s.visible()
+            .iter()
+            .filter_map(|&id| Some(s.model(id)?.name()))
+            .collect()
+    }
+
+    fn id_of(s: &Session, name: &str) -> u64 {
+        s.catalog()
+            .models()
+            .iter()
+            .find(|m| m.name() == name)
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn stacked_photos_show_through_their_model() {
+        let r = default_registry();
+        let mut s =
+            session_with_files(&["wolf.stl", "wolf.png", "boat.stl", "other.jpg", "kit.zip"]);
+        assert_eq!(
+            visible_names(&s),
+            ["wolf.stl", "boat.stl", "other.jpg", "kit.zip"]
+        );
+        let (wolf, photo) = (id_of(&s, "wolf.stl"), id_of(&s, "wolf.png"));
+        assert_eq!(s.stack(wolf), [photo]);
+        assert_eq!(s.cover(wolf), photo);
+        assert_eq!(s.cover(id_of(&s, "boat.stl")), id_of(&s, "boat.stl"));
+
+        // Filtering by images hides the model, so its photo shows on its own.
+        r.run("filter.format", &mut s, &json!({"format": "image"}))
+            .unwrap();
+        s.poll();
+        assert_eq!(visible_names(&s), ["wolf.png", "other.jpg"]);
+        r.run("filter.clear", &mut s, &json!(null)).unwrap();
+
+        r.run("view.toggle_photo_covers", &mut s, &json!(null))
+            .unwrap();
+        assert_eq!(s.cover(wolf), wolf, "renders again");
+    }
+
+    #[test]
+    fn the_loupe_steps_through_a_models_photos() {
+        let r = default_registry();
+        let mut s = session_with_files(&["wolf.stl", "wolf.png", "wolf 2.jpg", "boat.stl"]);
+        let (wolf, p1, p2) = (
+            id_of(&s, "wolf.stl"),
+            id_of(&s, "wolf.png"),
+            id_of(&s, "wolf 2.jpg"),
+        );
+        let boat = id_of(&s, "boat.stl");
+        r.run("select.model", &mut s, &json!({"id": boat})).unwrap();
+        assert!(!r.is_enabled("loupe.next_photo", &s), "boat has no photos");
+
+        r.run("select.model", &mut s, &json!({"id": wolf})).unwrap();
+        r.run("view.loupe", &mut s, &json!(null)).unwrap();
+        s.poll();
+        assert!(!r.is_enabled("loupe.show_3d", &s));
+        let mut shown = Vec::new();
+        for _ in 0..3 {
+            r.run("loupe.next_photo", &mut s, &json!(null)).unwrap();
+            s.poll();
+            shown.push(s.loupe().photo);
+        }
+        assert_eq!(
+            shown,
+            [Some(p1), Some(p2), None],
+            "photos, then the 3D view"
+        );
+        assert_eq!(s.loupe().id, Some(wolf));
+
+        r.run("loupe.show_photo", &mut s, &json!({"id": p2}))
+            .unwrap();
+        assert_eq!(s.loupe().picture_of, Some(p2));
+        r.run("loupe.show_3d", &mut s, &json!(null)).unwrap();
+        assert_eq!(s.loupe().photo, None);
+        assert!(
+            r.run("loupe.show_photo", &mut s, &json!({"id": wolf}))
+                .is_err(),
+            "a model is not its own photo"
+        );
     }
 
     #[test]

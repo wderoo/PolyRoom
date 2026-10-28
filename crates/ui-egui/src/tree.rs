@@ -257,6 +257,8 @@ mod tests {
             children,
             direct: total,
             total,
+            images: 0,
+            archives: 0,
             samples: Vec::new(),
         }
     }

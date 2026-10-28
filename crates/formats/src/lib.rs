@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 mod obj;
 mod stl;
 mod threemf;
@@ -16,23 +17,33 @@ use thiserror::Error;
 /// Hard cap on triangles per model, to keep a hostile file from exhausting memory.
 pub const MAX_TRIANGLES: usize = 50_000_000;
 
+/// A kind of file the library shows: a 3D model, a preview image or a ZIP archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Format {
     Stl,
     Obj,
     ThreeMf,
+    /// PNG, JPEG, WebP, GIF or BMP; the decoder sniffs the actual type.
+    Image,
+    Zip,
 }
 
 impl Format {
-    pub const ALL: [Self; 3] = [Self::Stl, Self::ThreeMf, Self::Obj];
+    pub const ALL: [Self; 5] = [Self::Stl, Self::ThreeMf, Self::Obj, Self::Image, Self::Zip];
 
     /// Detects the format from a file extension (case-insensitive).
     pub fn from_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-        match ext.as_str() {
+        Self::from_name(path.extension()?.to_str()?)
+    }
+
+    /// Detects the format from an extension without the dot (case-insensitive).
+    pub fn from_name(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
             "stl" => Some(Self::Stl),
             "obj" => Some(Self::Obj),
             "3mf" => Some(Self::ThreeMf),
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" => Some(Self::Image),
+            "zip" => Some(Self::Zip),
             _ => None,
         }
     }
@@ -42,7 +53,14 @@ impl Format {
             Self::Stl => "STL",
             Self::Obj => "OBJ",
             Self::ThreeMf => "3MF",
+            Self::Image => "Image",
+            Self::Zip => "ZIP",
         }
+    }
+
+    /// Whether files of this format hold a 3D model that [`load`] can read.
+    pub fn is_mesh(self) -> bool {
+        matches!(self, Self::Stl | Self::Obj | Self::ThreeMf)
     }
 }
 
@@ -100,6 +118,9 @@ fn sniff_other(bytes: &[u8]) -> Option<&'static str> {
 
 /// Parses an in-memory model file.
 pub fn load_bytes(format: Format, bytes: &[u8]) -> Result<Mesh, FormatError> {
+    if !format.is_mesh() {
+        return Err(FormatError::Unsupported);
+    }
     // 3MF files are ZIP archives; everything else must not be one of these.
     if let Some(what) = sniff_other(bytes).filter(|_| format != Format::ThreeMf) {
         return Err(FormatError::invalid(
@@ -114,6 +135,7 @@ pub fn load_bytes(format: Format, bytes: &[u8]) -> Result<Mesh, FormatError> {
         Format::Stl => stl::parse(bytes)?,
         Format::Obj => obj::parse(bytes)?,
         Format::ThreeMf => threemf::parse(bytes)?,
+        Format::Image | Format::Zip => return Err(FormatError::Unsupported),
     };
     if mesh.is_empty() {
         return Err(FormatError::Empty);
@@ -156,6 +178,20 @@ mod tests {
         assert_eq!(Format::from_path(Path::new("x.3mf")), Some(Format::ThreeMf));
         assert_eq!(Format::from_path(Path::new("x.step")), None);
         assert_eq!(Format::from_path(Path::new("noext")), None);
+        assert_eq!(Format::from_path(Path::new("p.JPEG")), Some(Format::Image));
+        assert_eq!(Format::from_path(Path::new("p.webp")), Some(Format::Image));
+        assert_eq!(Format::from_path(Path::new("a.3MF.zip")), Some(Format::Zip));
+        assert!(Format::Stl.is_mesh() && !Format::Image.is_mesh() && !Format::Zip.is_mesh());
+    }
+
+    #[test]
+    fn images_and_archives_are_not_loaded_as_meshes() {
+        for f in [Format::Image, Format::Zip] {
+            assert!(matches!(
+                load_bytes(f, b"solid x\nendsolid x\n"),
+                Err(FormatError::Unsupported)
+            ));
+        }
     }
 
     proptest! {

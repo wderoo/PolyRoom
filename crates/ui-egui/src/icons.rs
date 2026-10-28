@@ -90,6 +90,61 @@ pub fn up_arrow(painter: &Painter, rect: Rect, color: Color32) {
     painter.line_segment([c + vec2(h * 0.8, -h * 0.1), c + vec2(0.0, -h)], stroke);
 }
 
+/// A closed box with a zipper down the middle (for ZIP archives).
+pub fn archive(painter: &Painter, rect: Rect, color: Color32) {
+    let side = rect.width().min(rect.height());
+    let body = Rect::from_center_size(rect.center(), vec2(side * 0.8, side * 0.9));
+    let stroke = Stroke::new((side * 0.05).max(1.0), color);
+    painter.rect_stroke(body, 3.0, stroke, egui::StrokeKind::Middle);
+    let x = body.center().x;
+    let tooth = side * 0.07;
+    let mut y = body.top() + tooth;
+    let mut left = true;
+    // Alternating zipper teeth, down to a pull tab.
+    while y < body.center().y {
+        let dx = if left { -tooth } else { 0.0 };
+        painter.rect_filled(
+            Rect::from_min_size(pos2(x + dx, y), vec2(tooth, tooth * 0.8)),
+            0.0,
+            color,
+        );
+        y += tooth;
+        left = !left;
+    }
+    let tab = Rect::from_center_size(
+        pos2(x, body.center().y + tooth * 1.5),
+        vec2(tooth * 2.2, tooth * 3.0),
+    );
+    painter.rect_stroke(tab, 2.0, stroke, egui::StrokeKind::Middle);
+}
+
+/// A small landscape photo: a frame with a sun and a mountain (for stacked photos).
+pub fn photo(painter: &Painter, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(1.2, color);
+    painter.rect_stroke(rect, 1.5, stroke, egui::StrokeKind::Inside);
+    let inner = rect.shrink(rect.height() * 0.2);
+    painter.circle_filled(
+        pos2(
+            inner.left() + inner.width() * 0.25,
+            inner.top() + inner.height() * 0.25,
+        ),
+        inner.height() * 0.18,
+        color,
+    );
+    painter.add(Shape::convex_polygon(
+        vec![
+            pos2(inner.left(), inner.bottom()),
+            pos2(
+                inner.left() + inner.width() * 0.55,
+                inner.top() + inner.height() * 0.3,
+            ),
+            pos2(inner.right(), inner.bottom()),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
 pub fn label_color(label: ColorLabel) -> Color32 {
     match label {
         ColorLabel::Red => Color32::from_rgb(0xd9, 0x4c, 0x4c),

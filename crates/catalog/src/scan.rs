@@ -3,7 +3,7 @@ use std::time::UNIX_EPOCH;
 
 use polyroom_formats::Format;
 
-/// A supported model file found on disk.
+/// A supported file (model, image or archive) found on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedFile {
     pub path: PathBuf,
@@ -12,7 +12,7 @@ pub struct ScannedFile {
     pub modified: Option<u64>,
 }
 
-/// Recursively finds supported model files under `root`, sorted by path. Unreadable entries
+/// Recursively finds supported files under `root`, sorted by path. Unreadable entries
 /// are skipped.
 pub fn scan_folder(root: &Path) -> Vec<ScannedFile> {
     let mut out: Vec<ScannedFile> = walkdir::WalkDir::new(root)
@@ -55,6 +55,8 @@ mod tests {
             "sub/d.obj",
             "notes.txt",
             "e.step",
+            "a.png",
+            "sub/c.zip",
         ] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
@@ -63,7 +65,10 @@ mod tests {
             .iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["a.stl", "b.STL", "c.3mf", "d.obj"]);
+        assert_eq!(
+            names,
+            vec!["a.png", "a.stl", "b.STL", "c.3mf", "c.zip", "d.obj"]
+        );
         assert!(found.iter().all(|f| f.size == 1));
     }
 

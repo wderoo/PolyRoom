@@ -84,6 +84,7 @@ impl ColorLabel {
     }
 }
 
+/// A file in the library: a 3D model, a preview image or a ZIP archive (see `format`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id: ModelId,

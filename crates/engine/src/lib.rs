@@ -14,6 +14,7 @@ mod library;
 mod progress;
 mod session;
 mod settings;
+mod stacks;
 
 pub use attributes::AttributeFilter;
 pub use command::{Command, CommandRegistry, Key, Shortcut};
@@ -21,6 +22,7 @@ pub use error::EngineError;
 pub use folders::FolderNode;
 pub use polyroom_catalog::{Catalog, ColorLabel, Flag, Model, ModelId};
 pub use polyroom_formats::Format;
+pub use polyroom_formats::archive::ArchiveEntry;
 pub use polyroom_mesh::{Mesh, MeshStats};
 pub use polyroom_render::Image;
 pub use progress::Progress;

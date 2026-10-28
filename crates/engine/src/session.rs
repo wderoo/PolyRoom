@@ -5,6 +5,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use polyroom_catalog::{Catalog, CatalogError, Model, ModelId, Op, ScannedFile, SyncReport};
+use polyroom_formats::Format;
+use polyroom_formats::archive::ArchiveEntry;
 use polyroom_mesh::Mesh;
 use polyroom_preview::{Event, PreviewService};
 use polyroom_render::Image;
@@ -14,9 +16,13 @@ use crate::attributes::AttributeFilter;
 use crate::folders::{self, FolderNode};
 use crate::progress::{Progress, Tracker};
 use crate::settings::{self, Settings};
+use crate::stacks::Stacks;
 
 /// Finished thumbnails handed to the UI per frame.
 const THUMBNAILS_PER_FRAME: usize = 8;
+
+/// Longest side of an image shown in the loupe, in pixels.
+const LOUPE_PICTURE_PX: u32 = 2048;
 
 /// Preview jobs an import keeps queued at once; the rest wait in the engine so that cells the
 /// user scrolls to are served first.
@@ -125,12 +131,20 @@ impl Paths {
     }
 }
 
-/// The model shown in the loupe.
+/// The file shown in the loupe: a model's mesh, an image, or a ZIP's contents.
 #[derive(Debug, Default)]
 pub struct Loupe {
-    /// Model whose mesh is loaded (or loading).
+    /// File whose content is loaded (or loading).
     pub id: Option<ModelId>,
     pub mesh: Option<Arc<Mesh>>,
+    /// The image shown: the file itself if it is an image, else the stacked `photo`.
+    pub picture: Option<Arc<Image>>,
+    /// The image `picture` is (or will be) of.
+    pub picture_of: Option<ModelId>,
+    /// The files inside a ZIP.
+    pub archive: Option<Vec<ArchiveEntry>>,
+    /// A photo from the model's stack shown instead of the 3D view.
+    pub photo: Option<ModelId>,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -145,6 +159,8 @@ pub struct Session {
     pub thumb_size: f32,
     /// Whether the 3D view draws the build-plate grid.
     pub show_bed_grid: bool,
+    /// Whether models with stacked photos show their first photo in the grid instead of a render.
+    pub photo_covers: bool,
     /// Columns in the grid as last laid out by the UI; used for Up/Down navigation.
     pub grid_columns: usize,
 
@@ -158,10 +174,11 @@ pub struct Session {
     visible_folders: Vec<PathBuf>,
     visible_for: Option<VisibleKey>,
     folder_tree: Vec<FolderNode>,
+    stacks: Stacks,
     pub(crate) current: Option<ModelId>,
     pub(crate) selection: HashSet<ModelId>,
     pub(crate) anchor: Option<ModelId>,
-    loupe: Loupe,
+    pub(crate) loupe: Loupe,
     fresh_thumbnails: Vec<(ModelId, Image)>,
     /// Thumbnails that failed this session; not retried until restart.
     thumbnail_failed: HashSet<ModelId>,
@@ -185,6 +202,7 @@ impl Session {
         Self {
             thumb_size: settings::DEFAULT_THUMB_SIZE,
             show_bed_grid: true,
+            photo_covers: true,
             grid_columns: 1,
             ..Self::default()
         }
@@ -221,6 +239,7 @@ impl Session {
                 settings::DEFAULT_THUMB_SIZE
             },
             show_bed_grid: self.show_bed_grid,
+            photo_covers: self.photo_covers,
             panels: self.panels,
             view: self.view,
             module: self.module,
@@ -237,6 +256,7 @@ impl Session {
         };
         self.panels = settings.panels;
         self.show_bed_grid = settings.show_bed_grid;
+        self.photo_covers = settings.photo_covers;
         self.view = settings.view;
         self.module = settings.module;
         let available = match &settings.collection {
@@ -312,6 +332,20 @@ impl Session {
     /// Subfolders of the current folder, shown in the grid before its models.
     pub fn visible_folders(&self) -> &[PathBuf] {
         &self.visible_folders
+    }
+
+    /// The photos stacked on `id`, cover first (empty if none).
+    pub fn stack(&self, id: ModelId) -> &[ModelId] {
+        self.stacks.photos(id)
+    }
+
+    /// What the grid shows for `id`: its cover photo, if it has a stack and photo covers are
+    /// on, else `id` itself.
+    pub fn cover(&self, id: ModelId) -> ModelId {
+        match self.stack(id).first() {
+            Some(&photo) if self.photo_covers => photo,
+            _ => id,
+        }
     }
 
     /// One folder tree per imported folder.
@@ -532,7 +566,7 @@ impl Session {
         {
             return;
         }
-        let need_stats = model.stats.is_none();
+        let need_stats = model.format.is_mesh() && model.stats.is_none();
         preview.request_thumbnail(id, source(model), need_stats);
         self.import_progress.track(id);
     }
@@ -598,6 +632,22 @@ impl Session {
                         self.loupe.error = None;
                     }
                 }
+                Event::Picture { id, image } => {
+                    if self.loupe.picture_of == Some(id) {
+                        self.loupe.picture = Some(image);
+                        if self.loupe.id == Some(id) {
+                            self.loupe.loading = false;
+                            self.loupe.error = None;
+                        }
+                    }
+                }
+                Event::Archive { id, entries } => {
+                    if self.loupe.id == Some(id) {
+                        self.loupe.archive = Some(entries);
+                        self.loupe.loading = false;
+                        self.loupe.error = None;
+                    }
+                }
                 Event::Failed {
                     id,
                     error,
@@ -633,7 +683,10 @@ impl Session {
         match self.catalog.import(folder, files) {
             Ok(added) => {
                 self.status = match (found, added) {
-                    (0, _) => format!("No STL, 3MF or OBJ files found in {}", folder.display()),
+                    (0, _) => format!(
+                        "No models, images or ZIP files found in {}",
+                        folder.display()
+                    ),
                     (_, 0) => format!(
                         "All {found} models in {} were already imported",
                         folder.display()
@@ -664,30 +717,48 @@ impl Session {
         }
     }
 
-    /// Loads the current model's mesh when the loupe or viewer shows it.
-    fn update_loupe(&mut self) {
+    /// Loads what the loupe or viewer shows of the current file: a model's mesh, an image, a
+    /// ZIP's contents, or a photo from the model's stack.
+    pub(crate) fn update_loupe(&mut self) {
         let showing = self.module == Module::Viewer || self.view == ViewMode::Loupe;
         let Some(id) = self.current.filter(|_| showing) else {
             return;
         };
-        if self.loupe.id == Some(id) {
-            return;
-        }
-        let Some(model) = self.catalog.get(id) else {
-            return;
-        };
-        let source = source(model);
-        self.loupe.id = Some(id);
-        // The old mesh belongs to the previous model; the 3D view files whatever mesh it finds
-        // here under `loupe.id`.
-        self.loupe.mesh = None;
-        self.loupe.error = None;
-        match &mut self.preview {
-            Some(preview) => {
-                self.loupe.loading = true;
-                preview.request_mesh(id, source);
+        if self.loupe.id != Some(id) {
+            let Some(model) = self.catalog.get(id) else {
+                return;
+            };
+            let (format, source) = (model.format, source(model));
+            // Everything held belongs to the previous file; the 3D view files whatever mesh it
+            // finds here under `loupe.id`.
+            self.loupe = Loupe {
+                id: Some(id),
+                ..Loupe::default()
+            };
+            match &mut self.preview {
+                Some(preview) => {
+                    self.loupe.loading = true;
+                    match format {
+                        Format::Image => {
+                            self.loupe.picture_of = Some(id);
+                            preview.request_picture(id, source, LOUPE_PICTURE_PX);
+                        }
+                        Format::Zip => preview.request_archive(id, source),
+                        _ => preview.request_mesh(id, source),
+                    }
+                }
+                None => self.loupe.error = Some("previews are not available".into()),
             }
-            None => self.loupe.error = Some("previews are not available".into()),
+        }
+        // A stacked photo picked in the loupe.
+        if let Some(photo) = self.loupe.photo
+            && self.loupe.picture_of != Some(photo)
+        {
+            self.loupe.picture = None;
+            self.loupe.picture_of = Some(photo);
+            if let (Some(preview), Some(model)) = (&mut self.preview, self.catalog.get(photo)) {
+                preview.request_picture(photo, source(model), LOUPE_PICTURE_PX);
+            }
         }
     }
 
@@ -716,7 +787,9 @@ impl Session {
             .map(str::to_lowercase)
             .collect();
         if self.visible_for.as_ref().map(|k| k.0) != Some(key.0) {
-            self.folder_tree = folders::build(self.catalog.folders(), self.catalog.models());
+            self.stacks = Stacks::build(self.catalog.models());
+            self.folder_tree =
+                folders::build(self.catalog.folders(), self.catalog.models(), &self.stacks);
         }
         let last_import = self.catalog.last_import();
         // In a folder: only its own models, unless searching, which looks in subfolders too.
@@ -738,6 +811,13 @@ impl Session {
             })
             .map(|m| m.id)
             .collect();
+        // A photo stacked on a model that is shown is shown through that model.
+        let shown: HashSet<ModelId> = self.visible.iter().copied().collect();
+        self.visible.retain(|id| {
+            self.stacks
+                .owner(*id)
+                .is_none_or(|owner| !shown.contains(&owner))
+        });
         self.visible_folders = match &self.collection {
             Collection::Folder(f) if !searching => self
                 .folder(f)

@@ -24,6 +24,24 @@ pub fn models(n: u64) -> String {
     }
 }
 
+/// What a folder holds: `3 models · 4 images · 1 ZIP`, leaving out kinds it has none of.
+pub fn contents(models_n: u64, images: u64, archives: u64) -> String {
+    let mut parts = Vec::new();
+    if models_n > 0 || (images == 0 && archives == 0) {
+        parts.push(models(models_n));
+    }
+    if images > 0 {
+        parts.push(match images {
+            1 => "1 image".to_owned(),
+            n => format!("{} images", count(n)),
+        });
+    }
+    if archives > 0 {
+        parts.push(format!("{} ZIP", count(archives)));
+    }
+    parts.join(" · ")
+}
+
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = n as f64;
@@ -92,6 +110,9 @@ mod tests {
         assert_eq!(date(1_760_572_800), "2025-10-16");
         assert_eq!(volume(1000.0), "1.0 cm³");
         assert_eq!(models(1), "1 model");
+        assert_eq!(contents(3, 4, 1), "3 models · 4 images · 1 ZIP");
+        assert_eq!(contents(0, 1, 0), "1 image");
+        assert_eq!(contents(0, 0, 0), "0 models");
         assert_eq!(models(1500), "1,500 models");
     }
 }

@@ -6,7 +6,7 @@ use egui::{
     Align2, Color32, CornerRadius, FontId, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, pos2,
     vec2,
 };
-use polyroom_engine::{Flag, ModelId, Session};
+use polyroom_engine::{Flag, Format, ModelId, Session};
 use serde_json::json;
 
 use crate::layout::Actions;
@@ -46,11 +46,33 @@ fn cell_clicks(ui: &Ui, response: &egui::Response, id: ModelId, actions: &mut Ac
     }
 }
 
-/// Draws the thumbnail (or a placeholder) into `rect`, requesting it if needed.
-fn thumbnail(ui: &Ui, rect: Rect, id: ModelId, session: &mut Session, thumbs: &mut ThumbTextures) {
+/// Draws the thumbnail of `id` (its cover photo, if it has one) or a placeholder into `rect`,
+/// requesting it if needed.
+pub(crate) fn thumbnail(
+    ui: &Ui,
+    rect: Rect,
+    id: ModelId,
+    session: &mut Session,
+    thumbs: &mut ThumbTextures,
+) {
+    // A photo that can't be shown falls back to the model's own render.
+    let id = Some(session.cover(id))
+        .filter(|&c| !session.thumbnail_failed(c))
+        .unwrap_or(id);
+    let is_zip = session.model(id).is_some_and(|m| m.format == Format::Zip);
     if let Some(tex) = thumbs.get(id) {
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         ui.painter().image(tex, rect, uv, Color32::WHITE);
+    } else if is_zip
+        && session.thumbnail_failed(id)
+        && session.model(id).is_some_and(|m| m.error.is_none())
+    {
+        // A fine archive with nothing inside to preview.
+        icons::archive(
+            ui.painter(),
+            Rect::from_center_size(rect.center(), rect.size() * 0.4),
+            theme::TEXT_DIM,
+        );
     } else if session.thumbnail_failed(id) {
         ui.painter().text(
             rect.center(),
@@ -213,7 +235,11 @@ fn folder_cell(
     painter
         .with_clip_rect(Rect::from_min_size(caption, vec2(rect.width() - pad, 16.0)))
         .galley(caption, galley, theme::TEXT);
-    let count = crate::format::models(node.total as u64);
+    let count = crate::format::contents(
+        node.total.saturating_sub(node.images + node.archives) as u64,
+        node.images as u64,
+        node.archives as u64,
+    );
     painter.text(
         pos2(caption.x, rect.bottom() - 8.0),
         Align2::LEFT_BOTTOM,
@@ -278,6 +304,7 @@ fn grid_cell(
         // Lightroom dims rejected photos; do the same.
         painter.rect_filled(img, CornerRadius::ZERO, Color32::from_black_alpha(140));
     }
+    kind_badge(&painter, img, model.format, session.stack(id).len());
 
     // Flag badge, top-left.
     let badge = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(12.0, 14.0));
@@ -322,6 +349,30 @@ fn grid_cell(
     } else {
         response.on_hover_text(model.path.display().to_string());
     }
+}
+
+/// A pill in the bottom-right corner of `img`: the photo count of a stacked model, or "ZIP".
+fn kind_badge(painter: &egui::Painter, img: Rect, format: Format, photos: usize) {
+    let font = FontId::proportional(10.0);
+    let (text, icon) = match (format, photos) {
+        (Format::Zip, _) => ("ZIP".to_owned(), false),
+        (_, 0) => return,
+        (_, n) => (n.to_string(), true),
+    };
+    let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
+    let icon_w = if icon { 14.0 } else { 0.0 };
+    let size = vec2(galley.size().x + icon_w + 10.0, 16.0);
+    let pill = Rect::from_min_size(img.max - size - vec2(4.0, 4.0), size);
+    painter.rect_filled(pill, CornerRadius::same(8), Color32::from_black_alpha(170));
+    if icon {
+        let r = Rect::from_min_size(pill.min + vec2(5.0, 4.0), vec2(11.0, 8.0));
+        icons::photo(painter, r, Color32::WHITE);
+    }
+    let pos = pos2(
+        pill.left() + 5.0 + icon_w,
+        pill.center().y - galley.size().y / 2.0,
+    );
+    painter.galley(pos, galley, Color32::WHITE);
 }
 
 /// A horizontal strip of small thumbnails along the bottom, like Lightroom's filmstrip.
@@ -613,6 +664,19 @@ mod tests {
                 "the loupe loads the clicked model"
             );
         }
+    }
+
+    #[test]
+    fn a_photo_named_like_a_model_is_stacked_on_it_not_shown_alone() {
+        let files: Vec<String> = ["wolf.stl", "wolf.png", "boat.stl", "other.jpg", "kit.zip"]
+            .map(String::from)
+            .to_vec();
+        let (_dir, session) = imported(&files);
+        let mut harness = grid_harness(session);
+        harness.run();
+        let mut cells = visible_cells(&harness);
+        cells.sort();
+        assert_eq!(cells, ["boat.stl", "kit.zip", "other.jpg", "wolf.stl"]);
     }
 
     #[test]

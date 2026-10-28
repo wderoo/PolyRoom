@@ -157,7 +157,8 @@ impl PolyRoomApp {
                 if self.session.catalog().models().is_empty() {
                     layout::empty_library(ui, actions);
                 } else if show_loupe {
-                    self.loupe.show(ui, frame, &self.session);
+                    self.loupe
+                        .show(ui, frame, &mut self.session, &mut self.thumbs, actions);
                 } else {
                     layout::breadcrumbs(ui, &self.session, actions);
                     if self.session.visible().is_empty()

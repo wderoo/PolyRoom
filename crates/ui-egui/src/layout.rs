@@ -202,6 +202,23 @@ pub fn breadcrumbs(ui: &mut Ui, session: &Session, actions: &mut Actions) {
 pub fn right_panel(ui: &mut Ui, session: &mut Session, actions: &mut Actions) {
     let model = session.current().and_then(|id| session.model(id)).cloned();
     let selected = session.selection_len();
+    let photos = model.as_ref().map_or(0, |m| session.stack(m.id).len());
+    // What a ZIP holds, once the loupe has listed it.
+    let loupe = session.loupe();
+    let contents = loupe
+        .archive
+        .as_ref()
+        .filter(|_| model.as_ref().is_some_and(|m| loupe.id == Some(m.id)))
+        .map(|entries| {
+            let of = |f: fn(Format) -> bool| {
+                entries.iter().filter(|e| e.format.is_some_and(f)).count() as u64
+            };
+            format!(
+                "{} files · {}",
+                format::count(entries.len() as u64),
+                format::contents(of(Format::is_mesh), of(|f| f == Format::Image), 0)
+            )
+        });
     egui::Panel::right("right_panel")
         .default_size(270.0)
         .size_range(220.0..=440.0)
@@ -337,6 +354,12 @@ pub fn right_panel(ui: &mut Ui, session: &mut Session, actions: &mut Actions) {
                                 if let Some(m) = model.modified {
                                     row("Modified", format::date(m));
                                 }
+                                if photos > 0 {
+                                    row("Photos", format::count(photos as u64));
+                                }
+                                if let Some(contents) = &contents {
+                                    row("Contents", contents.clone());
+                                }
                                 match &model.stats {
                                     Some(s) => {
                                         row("Dimensions", format::dimensions(s));
@@ -344,7 +367,7 @@ pub fn right_panel(ui: &mut Ui, session: &mut Session, actions: &mut Actions) {
                                         row("Volume", format::volume(s.volume));
                                         row("Surface", format::area(s.area));
                                     }
-                                    None if model.error.is_none() => {
+                                    None if model.error.is_none() && model.format.is_mesh() => {
                                         row("Geometry", "loading…".into())
                                     }
                                     None => {}

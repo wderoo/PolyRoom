@@ -163,6 +163,17 @@ pub fn register_all(r: &mut CommandRegistry) {
         },
     });
     r.register(Command {
+        id: "view.toggle_photo_covers",
+        label: "Use Photos as Covers",
+        menu: "View/Use Photos as Covers",
+        shortcut: None,
+        enabled: always,
+        run: |s, _| {
+            s.photo_covers = !s.photo_covers;
+            Ok(())
+        },
+    });
+    r.register(Command {
         id: "view.thumb_size",
         label: "Set Thumbnail Size",
         menu: "",
