@@ -17,7 +17,8 @@ use thiserror::Error;
 /// Hard cap on triangles per model, to keep a hostile file from exhausting memory.
 pub const MAX_TRIANGLES: usize = 50_000_000;
 
-/// A kind of file the library shows: a 3D model, a preview image or a ZIP archive.
+/// A kind of file the library shows: a 3D model, a preview image, a ZIP archive, or any other
+/// file (which has no preview).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Format {
     Stl,
@@ -26,14 +27,34 @@ pub enum Format {
     /// PNG, JPEG, WebP, GIF or BMP; the decoder sniffs the actual type.
     Image,
     Zip,
+    /// A RAR archive, read like a ZIP.
+    Rar,
+    /// A 7-Zip archive, read like a ZIP.
+    SevenZ,
+    /// Anything else. Shown in the grid but never opened.
+    Other,
 }
 
 impl Format {
-    pub const ALL: [Self; 5] = [Self::Stl, Self::ThreeMf, Self::Obj, Self::Image, Self::Zip];
+    pub const ALL: [Self; 8] = [
+        Self::Stl,
+        Self::ThreeMf,
+        Self::Obj,
+        Self::Image,
+        Self::Zip,
+        Self::Rar,
+        Self::SevenZ,
+        Self::Other,
+    ];
 
     /// Detects the format from a file extension (case-insensitive).
     pub fn from_path(path: &Path) -> Option<Self> {
         Self::from_name(path.extension()?.to_str()?)
+    }
+
+    /// The format of any file: [`Format::Other`] when it is not one of the supported kinds.
+    pub fn classify(path: &Path) -> Self {
+        Self::from_path(path).unwrap_or(Self::Other)
     }
 
     /// Detects the format from an extension without the dot (case-insensitive).
@@ -44,6 +65,8 @@ impl Format {
             "3mf" => Some(Self::ThreeMf),
             "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" => Some(Self::Image),
             "zip" => Some(Self::Zip),
+            "rar" => Some(Self::Rar),
+            "7z" => Some(Self::SevenZ),
             _ => None,
         }
     }
@@ -55,12 +78,25 @@ impl Format {
             Self::ThreeMf => "3MF",
             Self::Image => "Image",
             Self::Zip => "ZIP",
+            Self::Rar => "RAR",
+            Self::SevenZ => "7Z",
+            Self::Other => "Other",
         }
     }
 
     /// Whether files of this format hold a 3D model that [`load`] can read.
     pub fn is_mesh(self) -> bool {
         matches!(self, Self::Stl | Self::Obj | Self::ThreeMf)
+    }
+
+    /// Whether files of this format are archives whose contents can be listed.
+    pub fn is_archive(self) -> bool {
+        matches!(self, Self::Zip | Self::Rar | Self::SevenZ)
+    }
+
+    /// Whether PolyRoom can show anything of files of this format.
+    pub fn is_previewable(self) -> bool {
+        self != Self::Other
     }
 }
 
@@ -135,7 +171,9 @@ pub fn load_bytes(format: Format, bytes: &[u8]) -> Result<Mesh, FormatError> {
         Format::Stl => stl::parse(bytes)?,
         Format::Obj => obj::parse(bytes)?,
         Format::ThreeMf => threemf::parse(bytes)?,
-        Format::Image | Format::Zip => return Err(FormatError::Unsupported),
+        Format::Image | Format::Zip | Format::Rar | Format::SevenZ | Format::Other => {
+            return Err(FormatError::Unsupported);
+        }
     };
     if mesh.is_empty() {
         return Err(FormatError::Empty);

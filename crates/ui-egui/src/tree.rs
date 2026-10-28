@@ -304,6 +304,7 @@ mod tests {
             total,
             images: 0,
             archives: 0,
+            others: 0,
             bytes: 0,
             samples: Vec::new(),
         }

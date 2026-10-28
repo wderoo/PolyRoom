@@ -14,6 +14,8 @@ use crate::thumbs::ThumbTextures;
 use crate::{icons, meta_ui, theme};
 
 const GAP: f32 = 8.0;
+/// Space kept free at the right of the grid, so the scroll bar does not sit on the cards.
+const RIGHT_MARGIN: f32 = 14.0;
 /// Space under the thumbnail for the name and stars.
 const CAPTION: f32 = 40.0;
 
@@ -108,8 +110,17 @@ pub(crate) fn thumbnail(
     let id = Some(session.cover(id))
         .filter(|&c| !session.thumbnail_failed(c))
         .unwrap_or(id);
-    let is_zip = session.model(id).is_some_and(|m| m.format == Format::Zip);
-    if let Some(tex) = thumbs.get(id) {
+    let is_zip = session.model(id).is_some_and(|m| m.format.is_archive());
+    if session
+        .model(id)
+        .is_some_and(|m| !m.format.is_previewable())
+    {
+        icons::file(
+            ui.painter(),
+            Rect::from_center_size(rect.center(), vec2(rect.width() * 0.3, rect.width() * 0.38)),
+            theme::TEXT_DIM,
+        );
+    } else if let Some(tex) = thumbs.get(id) {
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         ui.painter().image(tex, rect, uv, Color32::WHITE);
     } else if is_zip
@@ -160,7 +171,7 @@ pub fn grid(
 ) {
     let size = session.thumb_size;
     let cell = vec2(size, size + CAPTION);
-    let width = ui.available_width() - GAP;
+    let width = ui.available_width() - GAP - RIGHT_MARGIN;
     let cols = ((width + GAP) / (cell.x + GAP)).floor().max(1.0) as usize;
     session.grid_columns = cols;
     let ids: Vec<ModelId> = session.visible().to_vec();
@@ -296,9 +307,11 @@ fn folder_cell(
         .with_clip_rect(Rect::from_min_size(caption, vec2(rect.width() - pad, 16.0)))
         .galley(caption, galley, theme::TEXT);
     let count = crate::format::contents(
-        node.total.saturating_sub(node.images + node.archives) as u64,
+        node.total
+            .saturating_sub(node.images + node.archives + node.others) as u64,
         node.images as u64,
         node.archives as u64,
+        node.others as u64,
     );
     painter.text(
         pos2(caption.x, rect.bottom() - 8.0),
@@ -365,7 +378,7 @@ fn grid_cell(
         // Lightroom dims rejected photos; do the same.
         painter.rect_filled(img, CornerRadius::ZERO, Color32::from_black_alpha(140));
     }
-    kind_badge(&painter, img, model.format, session.stack(id).len());
+    kind_badge(&painter, img, &model, session.stack(id).len());
 
     // Flag badge, top-left.
     let badge = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(12.0, 14.0));
@@ -461,28 +474,50 @@ fn category_pill(
     );
 }
 
-/// A pill in the bottom-right corner of `img`: the photo count of a stacked model, or "ZIP".
-fn kind_badge(painter: &egui::Painter, img: Rect, format: Format, photos: usize) {
+/// What the badge of a file says: its type, e.g. "STL", "ZIP", or the extension of an image or
+/// other file.
+pub(crate) fn badge_text(model: &polyroom_engine::Model) -> String {
+    match model.format {
+        Format::Image | Format::Other => model
+            .path
+            .extension()
+            .map(|e| e.to_string_lossy().to_uppercase())
+            .filter(|e| !e.is_empty())
+            .map_or_else(
+                || "FILE".to_owned(),
+                |e| e.chars().take(5).collect::<String>(),
+            ),
+        format => format.label().to_uppercase(),
+    }
+}
+
+/// Pills on the thumbnail: the file type at the bottom right, and the photo count of a stacked
+/// model at the bottom left.
+fn kind_badge(painter: &egui::Painter, img: Rect, model: &polyroom_engine::Model, photos: usize) {
     let font = FontId::proportional(10.0);
-    let (text, icon) = match (format, photos) {
-        (Format::Zip, _) => ("ZIP".to_owned(), false),
-        (_, 0) => return,
-        (_, n) => (n.to_string(), true),
-    };
-    let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
-    let icon_w = if icon { 14.0 } else { 0.0 };
-    let size = vec2(galley.size().x + icon_w + 10.0, 16.0);
+    let galley = painter.layout_no_wrap(badge_text(model), font.clone(), Color32::WHITE);
+    let size = vec2(galley.size().x + 10.0, 16.0);
     let pill = Rect::from_min_size(img.max - size - vec2(4.0, 4.0), size);
     painter.rect_filled(pill, CornerRadius::same(8), Color32::from_black_alpha(170));
-    if icon {
-        let r = Rect::from_min_size(pill.min + vec2(5.0, 4.0), vec2(11.0, 8.0));
-        icons::photo(painter, r, Color32::WHITE);
-    }
-    let pos = pos2(
-        pill.left() + 5.0 + icon_w,
-        pill.center().y - galley.size().y / 2.0,
-    );
+    let pos = pos2(pill.left() + 5.0, pill.center().y - galley.size().y / 2.0);
     painter.galley(pos, galley, Color32::WHITE);
+
+    if photos > 0 {
+        let galley = painter.layout_no_wrap(photos.to_string(), font, Color32::WHITE);
+        let size = vec2(galley.size().x + 24.0, 16.0);
+        let pill = Rect::from_min_size(pos2(img.left() + 4.0, img.bottom() - size.y - 4.0), size);
+        painter.rect_filled(pill, CornerRadius::same(8), Color32::from_black_alpha(170));
+        icons::photo(
+            painter,
+            Rect::from_min_size(pill.min + vec2(5.0, 4.0), vec2(11.0, 8.0)),
+            Color32::WHITE,
+        );
+        painter.galley(
+            pos2(pill.left() + 19.0, pill.center().y - galley.size().y / 2.0),
+            galley,
+            Color32::WHITE,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -763,5 +798,32 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["m01.stl", "m02.stl", "m03.stl", "m04.stl"]);
+    }
+
+    #[test]
+    fn badges_name_the_type_of_every_kind_of_file() {
+        let model = |name: &str, format| polyroom_engine::Model {
+            id: 0,
+            path: std::path::PathBuf::from("C:/m").join(name),
+            folder: "C:/m".into(),
+            format,
+            size: 1,
+            modified: None,
+            added: 0,
+            import: 1,
+            rating: 0,
+            flag: Flag::None,
+            label: None,
+            stats: None,
+            meta: polyroom_engine::Meta::default(),
+            error: None,
+        };
+        assert_eq!(badge_text(&model("a.stl", Format::Stl)), "STL");
+        assert_eq!(badge_text(&model("a.3mf", Format::ThreeMf)), "3MF");
+        assert_eq!(badge_text(&model("a.zip", Format::Zip)), "ZIP");
+        assert_eq!(badge_text(&model("a.jpeg", Format::Image)), "JPEG");
+        assert_eq!(badge_text(&model("notes.pdf", Format::Other)), "PDF");
+        assert_eq!(badge_text(&model("README", Format::Other)), "FILE");
+        assert_eq!(badge_text(&model("a.longext", Format::Other)), "LONGE");
     }
 }

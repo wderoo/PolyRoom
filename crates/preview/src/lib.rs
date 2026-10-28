@@ -491,7 +491,7 @@ fn worker(
                             bad_file: true,
                         }),
                     }
-                } else if format == Some(Format::Zip) {
+                } else if format.is_some_and(Format::is_archive) {
                     match guarded(|| zip_cover(&source.path, style.size)) {
                         Ok(Cover::Image(image)) => {
                             write_cache(&cache_path, &image);
@@ -989,6 +989,83 @@ mod tests {
         });
         assert!(
             matches!(events.last(), Some(Event::Thumbnail { image, .. }) if image.width == 512),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_rar_gets_the_first_image_inside_as_its_cover_and_a_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50);
+        builder
+            .add_bytes(b"notes.txt".to_vec(), b"hi".to_vec(), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"cover.png".to_vec(), red_png(64, 32), None, None)
+            .unwrap();
+        let path = dir.path().join("kit.rar");
+        std::fs::write(&path, builder.to_bytes().unwrap()).unwrap();
+        let broken = dir.path().join("broken.rar");
+        std::fs::write(&broken, b"not a rar").unwrap();
+
+        let mut s = PreviewService::start(dir.path().join("cache"));
+        let source = |p: &Path| Source {
+            path: p.to_owned(),
+            size: 1,
+            modified: None,
+        };
+        let finished = |id: JobId| move |e: &Event| matches!(e, Event::Thumbnail { id: i, .. } | Event::Failed { id: i, .. } | Event::Archive { id: i, .. } if *i == id);
+
+        s.request_thumbnail(1, source(&path), false);
+        let events = wait_for(&mut s, finished(1));
+        assert!(
+            matches!(events.last(), Some(Event::Thumbnail { image, .. }) if image.width == THUMB_PX),
+            "{events:?}"
+        );
+
+        s.request_archive(2, source(&path));
+        let events = wait_for(&mut s, finished(2));
+        assert!(
+            matches!(events.last(), Some(Event::Archive { entries, .. }) if entries.len() == 2),
+            "{events:?}"
+        );
+
+        s.request_thumbnail(3, source(&broken), false);
+        let events = wait_for(&mut s, finished(3));
+        assert!(
+            matches!(events.last(), Some(Event::Failed { bad_file: true, .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_7z_gets_the_first_image_inside_as_its_cover_and_a_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("notes.txt"), b"hi").unwrap();
+        std::fs::write(source.join("cover.png"), red_png(64, 32)).unwrap();
+        let path = dir.path().join("kit.7z");
+        sevenz_rust2::compress_to_path(&source, &path).unwrap();
+
+        let mut s = PreviewService::start(dir.path().join("cache"));
+        let source = |p: &Path| Source {
+            path: p.to_owned(),
+            size: 1,
+            modified: None,
+        };
+        let finished = |id: JobId| move |e: &Event| matches!(e, Event::Thumbnail { id: i, .. } | Event::Failed { id: i, .. } | Event::Archive { id: i, .. } if *i == id);
+
+        s.request_thumbnail(1, source(&path), false);
+        let events = wait_for(&mut s, finished(1));
+        assert!(
+            matches!(events.last(), Some(Event::Thumbnail { image, .. }) if image.width == THUMB_PX),
+            "{events:?}"
+        );
+        s.request_archive(2, source(&path));
+        let events = wait_for(&mut s, finished(2));
+        assert!(
+            matches!(events.last(), Some(Event::Archive { entries, .. }) if entries.len() == 2),
             "{events:?}"
         );
     }

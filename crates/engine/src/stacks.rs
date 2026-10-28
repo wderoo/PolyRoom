@@ -49,6 +49,8 @@ impl Stacks {
             let stem = stem_of(&m.path);
             match m.format {
                 Format::Image => entry.images.push((m.path.as_path(), m.id, stem)),
+                // Files without a preview neither own photos nor are one.
+                Format::Other => {}
                 _ => entry.owners.push((m.id, stem)),
             }
         }

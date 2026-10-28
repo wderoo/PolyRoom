@@ -12,9 +12,14 @@ glam.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 zip.workspace = true
+rars.workspace = true
+sevenz-rust2.workspace = true
 quick-xml.workspace = true
 
 [dev-dependencies]
+sevenz-rust2 = { workspace = true, features = ["compress", "util"] }
+tempfile.workspace = true
+rars = { workspace = true, features = ["write"] }
 proptest.workspace = true
 
 [lints]

@@ -584,6 +584,7 @@ impl Session {
             return;
         };
         if model.error.is_some()
+            || !model.format.is_previewable()
             || self.thumbnail_failed.contains(&id)
             || preview.is_thumbnail_pending(id)
         {
@@ -723,7 +724,11 @@ impl Session {
                             .catalog
                             .models()
                             .iter()
-                            .filter(|m| m.import == last_import && m.error.is_none())
+                            .filter(|m| {
+                                m.import == last_import
+                                    && m.error.is_none()
+                                    && m.format.is_previewable()
+                            })
                             .map(|m| m.id);
                         self.import_progress.add(new_models);
                     }
@@ -766,7 +771,10 @@ impl Session {
                             self.loupe.picture_of = Some(id);
                             preview.request_picture(id, source, LOUPE_PICTURE_PX);
                         }
-                        Format::Zip => preview.request_archive(id, source),
+                        Format::Zip | Format::Rar | Format::SevenZ => {
+                            preview.request_archive(id, source)
+                        }
+                        Format::Other => self.loupe.loading = false,
                         _ => preview.request_mesh(id, source),
                     }
                 }

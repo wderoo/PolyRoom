@@ -6,7 +6,7 @@ use egui::{
     Align2, Color32, CornerRadius, FontId, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2,
     vec2,
 };
-use polyroom_engine::{Format, ModelId, Session};
+use polyroom_engine::{ArchiveEntry, Format, ModelId, Session};
 use polyroom_render::{Camera, GpuMesh, Renderer, Style, Target};
 use serde_json::json;
 
@@ -61,6 +61,8 @@ pub struct LoupeView {
     upload_error: Option<String>,
     /// The image shown, as a texture, and which file it is of.
     picture: Option<(ModelId, egui::TextureHandle)>,
+    /// The widest file name of the archive shown: (archive, number of files, width).
+    archive_width: Option<(ModelId, usize, f32)>,
 }
 
 impl LoupeView {
@@ -81,8 +83,9 @@ impl LoupeView {
         };
         let format = session.model(current).map(|m| m.format);
         let photo = session.loupe().photo;
-        if format == Some(Format::Zip) {
-            show_archive(ui, rect, session);
+
+        if format == Some(Format::Other) {
+            show_no_preview(ui, rect, session);
             return;
         }
         if format == Some(Format::Image) || photo.is_some() {
@@ -275,7 +278,138 @@ impl LoupeView {
     }
 }
 
+/// Height of a row of the archive's file list.
+const ROW: f32 = 20.0;
+const TYPE_W: f32 = 56.0;
+const SIZE_W: f32 = 76.0;
+const CELL_PAD: f32 = 8.0;
+
 impl LoupeView {
+    /// An archive: its cover image, then its files in a table as wide as the pane. Long names
+    /// scroll sideways inside the table instead of widening the pane.
+    pub fn show_archive(&mut self, ui: &mut Ui, session: &mut Session, thumbs: &mut ThumbTextures) {
+        let Some(id) = session.current() else {
+            return;
+        };
+        let width = ui.available_width();
+        let (cover, _) = ui.allocate_exact_size(vec2(width, width * 0.6), Sense::hover());
+        ui.painter()
+            .rect_filled(cover, CornerRadius::same(4), theme::CENTER);
+        let side = cover.height();
+        let square = Rect::from_center_size(cover.center(), vec2(side, side));
+        crate::grid::thumbnail(ui, square, id, session, thumbs);
+        ui.add_space(6.0);
+
+        let loupe = session.loupe();
+        let Some(entries) = loupe.archive.as_ref().filter(|_| loupe.id == Some(id)) else {
+            match &loupe.error {
+                Some(error) => {
+                    ui.label(
+                        RichText::new(format!("Can't open this archive\n{error}"))
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+                None => {
+                    ui.label(RichText::new("Reading archive…").color(theme::TEXT_DIM));
+                    ui.ctx().request_repaint();
+                }
+            }
+            return;
+        };
+        let models = entries
+            .iter()
+            .filter(|e| e.format.is_some_and(Format::is_mesh))
+            .count();
+        let images = entries
+            .iter()
+            .filter(|e| e.format == Some(Format::Image))
+            .count();
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "{} files · {} · {} inside",
+                    crate::format::count(entries.len() as u64),
+                    crate::format::contents(models as u64, images as u64, 0, 0),
+                    crate::format::bytes(
+                        entries.iter().map(|e| e.size).fold(0, u64::saturating_add)
+                    ),
+                ))
+                .color(theme::TEXT_DIM),
+            )
+            .wrap(),
+        );
+        ui.add_space(4.0);
+        self.file_list(ui, id, entries, width);
+    }
+
+    /// The files of an archive: name, type and size, striped, scrolling both ways.
+    fn file_list(&mut self, ui: &mut Ui, id: ModelId, entries: &[ArchiveEntry], width: f32) {
+        let font = FontId::proportional(13.0);
+        let name_width = match self.archive_width {
+            Some((cached, n, w)) if cached == id && n == entries.len() => w,
+            _ => {
+                let widest = entries
+                    .iter()
+                    .map(|e| {
+                        ui.painter()
+                            .layout_no_wrap(e.name.clone(), font.clone(), theme::TEXT)
+                            .size()
+                            .x
+                    })
+                    .fold(0.0, f32::max);
+                self.archive_width = Some((id, entries.len(), widest));
+                widest
+            }
+        };
+        let total = (name_width + TYPE_W + SIZE_W + CELL_PAD * 4.0).max(width);
+        let height = (width * 0.9).max(260.0);
+        egui::ScrollArea::both()
+            .id_salt(("archive-list", id))
+            .max_height(height)
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show_rows(ui, ROW, entries.len(), |ui, range| {
+                ui.set_min_width(total);
+                for i in range {
+                    let Some(e) = entries.get(i) else {
+                        continue;
+                    };
+                    let (rect, _) = ui.allocate_exact_size(vec2(total, ROW), Sense::hover());
+                    let painter = ui.painter();
+                    if i % 2 == 1 {
+                        painter.rect_filled(rect, 0.0, Color32::from_white_alpha(8));
+                    }
+                    let color = if e.format.is_some() {
+                        theme::TEXT
+                    } else {
+                        theme::TEXT_DIM
+                    };
+                    let mid = rect.center().y;
+                    painter.text(
+                        pos2(rect.left() + CELL_PAD, mid),
+                        Align2::LEFT_CENTER,
+                        &e.name,
+                        font.clone(),
+                        color,
+                    );
+                    painter.text(
+                        pos2(rect.right() - CELL_PAD - SIZE_W - TYPE_W, mid),
+                        Align2::LEFT_CENTER,
+                        e.format.map_or("", Format::label),
+                        font.clone(),
+                        theme::TEXT_DIM,
+                    );
+                    painter.text(
+                        pos2(rect.right() - CELL_PAD, mid),
+                        Align2::RIGHT_CENTER,
+                        crate::format::bytes(e.size),
+                        font.clone(),
+                        theme::TEXT_DIM,
+                    );
+                }
+            });
+    }
+
     /// A "Reset" button in the top-right corner that fits the model back into view.
     fn reset_button(&mut self, ui: &mut Ui, rect: Rect) {
         let button = Rect::from_min_size(rect.right_top() + vec2(-62.0, 8.0), vec2(54.0, 22.0));
@@ -356,72 +490,26 @@ impl LoupeView {
     }
 }
 
-/// The files inside a ZIP, as a list.
-fn show_archive(ui: &mut Ui, rect: Rect, session: &Session) {
-    ui.painter().rect_filled(rect, 0.0, theme::CENTER);
-    let loupe = session.loupe();
-    let name = session
+/// A file PolyRoom cannot show: a file icon and its type.
+fn show_no_preview(ui: &mut Ui, rect: Rect, session: &Session) {
+    ui.allocate_rect(rect, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, theme::CENTER);
+    let side = (rect.width().min(rect.height()) * 0.35).max(24.0);
+    let icon = Rect::from_center_size(rect.center() - vec2(0.0, 12.0), vec2(side * 0.8, side));
+    crate::icons::file(&painter, icon, theme::TEXT_DIM);
+    let label = session
         .current()
         .and_then(|id| session.model(id))
-        .map(|m| m.name())
+        .map(crate::grid::badge_text)
         .unwrap_or_default();
-    let Some(entries) = &loupe.archive else {
-        ui.allocate_rect(rect, Sense::hover());
-        match &loupe.error {
-            Some(error) => centered(ui.painter(), rect, &format!("Can't open this ZIP\n{error}")),
-            None => {
-                centered(ui.painter(), rect, "Reading archive…");
-                ui.ctx().request_repaint();
-            }
-        }
-        return;
-    };
-    let models = entries
-        .iter()
-        .filter(|e| e.format.is_some_and(Format::is_mesh))
-        .count();
-    let images = entries
-        .iter()
-        .filter(|e| e.format == Some(Format::Image))
-        .count();
-    let width = rect.width().min(720.0) - 32.0;
-    let inner = Rect::from_center_size(rect.center(), vec2(width.max(100.0), rect.height() - 32.0));
-    ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
-        ui.label(RichText::new(name).size(16.0).color(theme::TEXT));
-        ui.label(
-            RichText::new(format!(
-                "{} files · {} · {} inside",
-                crate::format::count(entries.len() as u64),
-                crate::format::contents(models as u64, images as u64, 0),
-                crate::format::bytes(entries.iter().map(|e| e.size).fold(0, u64::saturating_add)),
-            ))
-            .color(theme::TEXT_DIM),
-        );
-        ui.add_space(8.0);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("archive-entries")
-                    .striped(true)
-                    .num_columns(3)
-                    .min_col_width(60.0)
-                    .show(ui, |ui| {
-                        for e in entries {
-                            let known = e.format.is_some();
-                            let color = if known { theme::TEXT } else { theme::TEXT_DIM };
-                            ui.label(RichText::new(&e.name).color(color));
-                            ui.label(
-                                RichText::new(e.format.map_or("", Format::label))
-                                    .color(theme::TEXT_DIM),
-                            );
-                            ui.label(
-                                RichText::new(crate::format::bytes(e.size)).color(theme::TEXT_DIM),
-                            );
-                            ui.end_row();
-                        }
-                    });
-            });
-    });
+    painter.text(
+        pos2(rect.center().x, icon.bottom() + 14.0),
+        Align2::CENTER_CENTER,
+        format!("{label} file · no preview available"),
+        FontId::proportional(13.0),
+        theme::TEXT_DIM,
+    );
 }
 
 /// A row of chips along the bottom of the loupe: the 3D view, then each stacked photo.
@@ -497,4 +585,91 @@ fn centered(painter: &egui::Painter, rect: Rect, text: &str) {
         FontId::proportional(16.0),
         theme::TEXT_DIM,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn entry(name: &str, size: u64) -> ArchiveEntry {
+        ArchiveEntry {
+            name: name.to_owned(),
+            size,
+            format: Format::from_name(name.rsplit('.').next().unwrap_or("")),
+        }
+    }
+
+    /// Regression: a long file name in an archive made the whole preview pane grow. The list
+    /// must scroll sideways instead and keep to the width it was given.
+    #[test]
+    fn long_file_names_scroll_the_list_instead_of_widening_it() {
+        let _gpu = crate::GPU_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        const WIDTH: f32 = 300.0;
+        let long = format!("{}/model.stl", "a_very_long_folder_name_".repeat(12));
+        let entries = vec![
+            entry("short.stl", 10),
+            entry(&long, 2_000_000),
+            entry("c.png", 3),
+        ];
+        let used = Cell::new(0.0f32);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(WIDTH + 40.0, 400.0))
+            .build_ui_state(
+                |ui, view: &mut LoupeView| {
+                    crate::theme::apply(ui.ctx());
+                    ui.set_max_width(WIDTH);
+                    view.file_list(ui, 1, &entries, WIDTH);
+                    used.set(ui.min_rect().width());
+                },
+                LoupeView::default(),
+            );
+        harness.run_steps(3);
+        harness.event(egui::Event::PointerMoved(egui::pos2(60.0, 40.0)));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(-2000.0, 0.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(6);
+        assert!(
+            used.get() <= WIDTH + 0.5,
+            "the list is {} wide, wider than the {WIDTH} it was given",
+            used.get()
+        );
+        if let Ok(image) = harness.render() {
+            let out = std::env::temp_dir().join("polyroom_archive_list.png");
+            image.save(&out).unwrap();
+            eprintln!("rendered {}", out.display());
+        }
+        // The widest name is measured once and reused.
+        assert!(matches!(
+            harness.state().archive_width,
+            Some((1, 3, w)) if w > WIDTH
+        ));
+    }
+
+    #[test]
+    fn a_short_list_fills_the_width_it_is_given() {
+        const WIDTH: f32 = 400.0;
+        let entries = vec![entry("a.stl", 1), entry("b.stl", 2)];
+        let used = Cell::new(0.0f32);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(WIDTH + 40.0, 300.0))
+            .build_ui_state(
+                |ui, view: &mut LoupeView| {
+                    crate::theme::apply(ui.ctx());
+                    view.file_list(ui, 1, &entries, WIDTH);
+                    used.set(ui.min_rect().width());
+                },
+                LoupeView::default(),
+            );
+        harness.run_steps(3);
+        assert!(used.get() >= WIDTH - 0.5, "{}", used.get());
+    }
 }

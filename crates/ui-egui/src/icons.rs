@@ -176,3 +176,28 @@ pub fn heart(painter: &Painter, rect: Rect, color: Color32) {
 
 /// The colour of a favorite heart.
 pub const HEART: Color32 = Color32::from_rgb(0xe0, 0x4f, 0x6a);
+
+/// A page with a folded corner: a file that has no preview.
+pub fn file(painter: &Painter, rect: Rect, color: Color32) {
+    let fold = rect.width() * 0.3;
+    painter.add(Shape::convex_polygon(
+        vec![
+            rect.left_top(),
+            pos2(rect.right() - fold, rect.top()),
+            pos2(rect.right(), rect.top() + fold),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ],
+        color.gamma_multiply(0.5),
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        vec![
+            pos2(rect.right() - fold, rect.top()),
+            pos2(rect.right() - fold, rect.top() + fold),
+            pos2(rect.right(), rect.top() + fold),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}

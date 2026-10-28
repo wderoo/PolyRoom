@@ -147,10 +147,14 @@ fn model_preview(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let width = ui.available_width();
-            let height = (width * 0.85).max(180.0);
-            ui.allocate_ui(vec2(width, height), |ui| {
-                loupe.show(ui, render_state, session, thumbs, actions);
-            });
+            if model.format.is_archive() {
+                loupe.show_archive(ui, session, thumbs);
+            } else {
+                let height = (width * 0.85).max(180.0);
+                ui.allocate_ui(vec2(width, height), |ui| {
+                    loupe.show(ui, render_state, session, thumbs, actions);
+                });
+            }
             ui.add_space(8.0);
             ui.add(egui::Label::new(RichText::new(model.name()).strong().size(15.0)).wrap());
             if selected > 1 {
@@ -204,7 +208,7 @@ fn archive_contents(session: &Session, model: &Model) -> Option<String> {
     Some(format!(
         "{} files · {}",
         format::count(entries.len() as u64),
-        format::contents(of(Format::is_mesh), of(|f| f == Format::Image), 0)
+        format::contents(of(Format::is_mesh), of(|f| f == Format::Image), 0, 0)
     ))
 }
 
@@ -406,9 +410,12 @@ fn folder_preview(
             });
             ui.label(
                 RichText::new(format::contents(
-                    node.total.saturating_sub(node.images + node.archives) as u64,
+                    node.total
+                        .saturating_sub(node.images + node.archives + node.others)
+                        as u64,
                     node.images as u64,
                     node.archives as u64,
+                    node.others as u64,
                 ))
                 .color(theme::TEXT_DIM),
             );

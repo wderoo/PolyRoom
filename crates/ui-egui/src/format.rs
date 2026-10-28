@@ -24,10 +24,11 @@ pub fn models(n: u64) -> String {
     }
 }
 
-/// What a folder holds: `3 models · 4 images · 1 ZIP`, leaving out kinds it has none of.
-pub fn contents(models_n: u64, images: u64, archives: u64) -> String {
+/// What a folder holds: `3 models · 4 images · 1 archive · 2 other files`, leaving out kinds it has
+/// none of.
+pub fn contents(models_n: u64, images: u64, archives: u64, others: u64) -> String {
     let mut parts = Vec::new();
-    if models_n > 0 || (images == 0 && archives == 0) {
+    if models_n > 0 || (images == 0 && archives == 0 && others == 0) {
         parts.push(models(models_n));
     }
     if images > 0 {
@@ -37,7 +38,16 @@ pub fn contents(models_n: u64, images: u64, archives: u64) -> String {
         });
     }
     if archives > 0 {
-        parts.push(format!("{} ZIP", count(archives)));
+        parts.push(match archives {
+            1 => "1 archive".to_owned(),
+            n => format!("{} archives", count(n)),
+        });
+    }
+    if others > 0 {
+        parts.push(match others {
+            1 => "1 other file".to_owned(),
+            n => format!("{} other files", count(n)),
+        });
     }
     parts.join(" · ")
 }
@@ -110,9 +120,11 @@ mod tests {
         assert_eq!(date(1_760_572_800), "2025-10-16");
         assert_eq!(volume(1000.0), "1.0 cm³");
         assert_eq!(models(1), "1 model");
-        assert_eq!(contents(3, 4, 1), "3 models · 4 images · 1 ZIP");
-        assert_eq!(contents(0, 1, 0), "1 image");
-        assert_eq!(contents(0, 0, 0), "0 models");
+        assert_eq!(contents(3, 4, 1, 0), "3 models · 4 images · 1 archive");
+        assert_eq!(contents(3, 0, 0, 2), "3 models · 2 other files");
+        assert_eq!(contents(0, 0, 0, 1), "1 other file");
+        assert_eq!(contents(0, 1, 0, 0), "1 image");
+        assert_eq!(contents(0, 0, 0, 0), "0 models");
         assert_eq!(models(1500), "1,500 models");
     }
 }

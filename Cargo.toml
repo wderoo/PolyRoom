@@ -32,6 +32,8 @@ walkdir = "2"
 tempfile = "3"
 
 # Formats
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2", "deflate"] }
+rars = { version = "0.12", default-features = false }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 quick-xml = "0.42"
 png = "0.18"

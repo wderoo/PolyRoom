@@ -942,4 +942,39 @@ mod tests {
         assert_eq!(s.take_stale_thumbnails().len(), 3);
         assert!(!s.thumbnail_failed(0), "failures are retried");
     }
+
+    #[test]
+    fn files_without_a_preview_are_listed_and_counted_but_never_loaded() {
+        let mut s = session();
+        s.catalog
+            .import(
+                Path::new("C:/m"),
+                vec![ScannedFile {
+                    path: Path::new("C:/m").join("notes.pdf"),
+                    format: Format::Other,
+                    size: 50,
+                    modified: None,
+                }],
+            )
+            .unwrap();
+        s.refresh_visible();
+        assert!(names(&s).contains(&"notes.pdf".to_owned()));
+        let id = s
+            .visible()
+            .iter()
+            .copied()
+            .find(|&i| s.model(i).is_some_and(|m| m.name() == "notes.pdf"))
+            .unwrap();
+        assert!(!s.model(id).unwrap().format.is_previewable());
+        assert!(!s.thumbnail_failed(id), "no preview is not a failure");
+
+        let root = s.folder(Path::new("C:/m")).unwrap();
+        assert_eq!(root.others, 1);
+        assert!(!root.samples.contains(&id), "folder covers skip such files");
+
+        // Selecting it must not start loading anything.
+        run(&mut s, "select.model", json!({"id": id})).unwrap();
+        s.poll();
+        assert!(!s.loupe().loading);
+    }
 }
